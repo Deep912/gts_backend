@@ -523,6 +523,37 @@ app.get("/empty-cylinders-grouped", authenticateJWT, async (req, res) => {
 //admin
 //part
 
+app.get("/admin/gas-types", authenticateJWT, async (req, res) => {
+  try {
+    const result = await pool.query(
+      "SELECT id, name FROM gas_types ORDER BY name"
+    );
+    res.json(result.rows);
+  } catch (error) {
+    console.error("Error fetching gas types:", error);
+    res.status(500).json({ error: "Database error", details: error.message });
+  }
+});
+
+app.get(
+  "/admin/gas-sub-types/:gasTypeId",
+  authenticateJWT,
+  async (req, res) => {
+    const { gasTypeId } = req.params;
+
+    try {
+      const result = await pool.query(
+        "SELECT id, name FROM gas_sub_types WHERE gas_type_id = $1 ORDER BY name",
+        [gasTypeId]
+      );
+      res.json(result.rows);
+    } catch (error) {
+      console.error("Error fetching gas sub-types:", error);
+      res.status(500).json({ error: "Database error", details: error.message });
+    }
+  }
+);
+
 app.get("/admin/transactions", authenticateJWT, async (req, res) => {
   try {
     if (req.user.role !== "admin" && req.user.role !== "owner") {
@@ -700,7 +731,7 @@ app.post("/admin/update-cylinder-status", authenticateJWT, async (req, res) => {
 app.post("/admin/add-cylinder", authenticateJWT, async (req, res) => {
   const {
     serial_number,
-    gas_type,
+    gas_sub_type_id, // 🔹 Updated: Using sub-type ID instead of gas_type
     size,
     status,
     company_id,
@@ -708,6 +739,21 @@ app.post("/admin/add-cylinder", authenticateJWT, async (req, res) => {
     capacity,
     measurement_unit,
   } = req.body;
+
+  // ✅ Validate gas_sub_type_id: Ensure it exists in the database
+  try {
+    const gasCheck = await pool.query(
+      "SELECT id FROM gas_sub_types WHERE id = $1",
+      [gas_sub_type_id]
+    );
+    if (gasCheck.rows.length === 0) {
+      return res.status(400).json({ error: "Invalid gas sub-type ID" });
+    }
+  } catch (error) {
+    return res
+      .status(500)
+      .json({ error: "Database error", details: error.message });
+  }
 
   // ✅ Validate capacity: Ensure it's a positive number
   if (!capacity || isNaN(capacity) || capacity <= 0) {
@@ -725,11 +771,11 @@ app.post("/admin/add-cylinder", authenticateJWT, async (req, res) => {
   try {
     await pool.query(
       `INSERT INTO cylinders 
-       (serial_number, gas_type, size, status, last_updated, company_id, product_grade, capacity, measurement_unit) 
+       (serial_number, gas_sub_type_id, size, status, last_updated, company_id, product_grade, capacity, measurement_unit) 
        VALUES ($1, $2, $3, $4, NOW(), $5, $6, $7, $8)`,
       [
         serial_number,
-        gas_type,
+        gas_sub_type_id, // 🔹 Updated: Using sub-type ID instead of gas_type
         size,
         status,
         company_id,
@@ -742,7 +788,7 @@ app.post("/admin/add-cylinder", authenticateJWT, async (req, res) => {
     // 1️⃣ Log the event
     await logEvent("add_cylinder", req.user.id, {
       serial_number,
-      gas_type,
+      gas_sub_type_id, // 🔹 Updated: Using sub-type ID instead of gas_type
       size,
       status,
       company_id,
