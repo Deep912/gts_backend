@@ -697,46 +697,19 @@ app.post("/admin/update-cylinder-status", authenticateJWT, async (req, res) => {
   res.json({ message: "Status updated successfully!" });
 });
 
+const allowedSizes = [10, 20, 30, 50, 100];
+
 app.post("/admin/add-cylinder", authenticateJWT, async (req, res) => {
-  const {
-    serial_number,
-    gas_type,
-    size,
-    status,
-    company_id,
-    product_grade,
-    capacity,
-    measurement_unit,
-  } = req.body;
+  const { serial_number, gas_type, size, status } = req.body;
 
-  // ✅ Validate capacity: Ensure it's a positive number
-  if (!capacity || isNaN(capacity) || capacity <= 0) {
-    return res.status(400).json({ error: "Invalid capacity value" });
-  }
-
-  // ✅ Validate measurement unit: Ensure it's one of the expected units
-  const allowedUnits = ["L", "KG", "m³"]; // Define valid units
-  if (!allowedUnits.includes(measurement_unit)) {
-    return res
-      .status(400)
-      .json({ error: "Invalid measurement unit. Allowed: L, KG, m³" });
+  if (!allowedSizes.includes(size)) {
+    return res.status(400).json({ error: "Invalid cylinder size" });
   }
 
   try {
     await pool.query(
-      `INSERT INTO cylinders 
-       (serial_number, gas_type, size, status, last_updated, company_id, product_grade, capacity, measurement_unit) 
-       VALUES ($1, $2, $3, $4, NOW(), $5, $6, $7, $8)`,
-      [
-        serial_number,
-        gas_type,
-        size,
-        status,
-        company_id,
-        product_grade,
-        capacity,
-        measurement_unit,
-      ]
+      "INSERT INTO cylinders (serial_number, gas_type, size, status) VALUES ($1, $2, $3, $4)",
+      [serial_number, gas_type, size, status]
     );
 
     // 1️⃣ Log the event
@@ -745,18 +718,13 @@ app.post("/admin/add-cylinder", authenticateJWT, async (req, res) => {
       gas_type,
       size,
       status,
-      company_id,
-      product_grade,
-      capacity,
-      measurement_unit,
     });
 
     res.json({ message: "Cylinder added successfully!" });
   } catch (error) {
-    res.status(500).json({ error: "Database error", details: error.message });
+    res.status(500).json({ error: "Database error" });
   }
 });
-
 app.get("/admin/generate-cylinder-id", authenticateJWT, async (req, res) => {
   try {
     if (req.user.role !== "admin" && req.user.role !== "owner") {
