@@ -719,6 +719,82 @@ app.post("/admin/delete-cylinder", authenticateJWT, async (req, res) => {
   }
 });
 
+// Update a gas product
+app.put("/admin/update-product/:id", authenticateJWT, async (req, res) => {
+  const { id } = req.params;
+  const { gas_sub_type_id, capacity, measurement_unit, description } = req.body;
+
+  if (!gas_sub_type_id || !capacity || !measurement_unit) {
+    return res.status(400).json({
+      error:
+        "Missing required fields: gas_sub_type_id, capacity, measurement_unit",
+    });
+  }
+
+  try {
+    // Retrieve the gas sub type name for computing the product name.
+    const gasSubTypeResult = await pool.query(
+      "SELECT name FROM gas_sub_types WHERE id = $1",
+      [gas_sub_type_id]
+    );
+    if (gasSubTypeResult.rows.length === 0) {
+      return res.status(400).json({ error: "Invalid gas_sub_type_id" });
+    }
+
+    const gasSubTypeName = gasSubTypeResult.rows[0].name;
+    // Compute the product name (e.g., "Industrial 50L")
+    const computedName = `${gasSubTypeName} ${capacity}${measurement_unit}`;
+
+    // Update the gas product record.
+    const result = await pool.query(
+      `UPDATE gas_products 
+       SET gas_sub_type_id = $1, capacity = $2, measurement_unit = $3, description = $4, name = $5
+       WHERE id = $6 RETURNING *`,
+      [
+        gas_sub_type_id,
+        capacity,
+        measurement_unit,
+        description || "",
+        computedName,
+        id,
+      ]
+    );
+
+    if (result.rowCount === 0) {
+      return res.status(404).json({ error: "Product not found" });
+    }
+
+    res.json({
+      message: "Product updated successfully",
+      gas_product: result.rows[0],
+    });
+  } catch (error) {
+    console.error("Error updating product:", error);
+    res.status(500).json({ error: "Database error", details: error.message });
+  }
+});
+
+// Delete a gas product
+app.delete("/admin/delete-product/:id", authenticateJWT, async (req, res) => {
+  const { id } = req.params;
+  try {
+    const result = await pool.query(
+      "DELETE FROM gas_products WHERE id = $1 RETURNING *",
+      [id]
+    );
+    if (result.rowCount === 0) {
+      return res.status(404).json({ error: "Product not found" });
+    }
+    res.json({
+      message: "Product deleted successfully",
+      gas_product: result.rows[0],
+    });
+  } catch (error) {
+    console.error("Error deleting product:", error);
+    res.status(500).json({ error: "Database error", details: error.message });
+  }
+});
+
 app.post("/admin/update-cylinder-status", authenticateJWT, async (req, res) => {
   const { serial_number, status } = req.body;
   await pool.query(
