@@ -774,6 +774,34 @@ app.put("/admin/update-product/:id", authenticateJWT, async (req, res) => {
   }
 });
 
+// Inventory Summary Endpoint
+app.get("/admin/inventory-summary", authenticateJWT, async (req, res) => {
+  try {
+    // This query aggregates cylinder counts by gas product.
+    // It joins cylinders with gas_products, gas_sub_types, and gas_types
+    // to build a descriptive product name.
+    const query = `
+      SELECT 
+        gp.id,
+        CONCAT(gt.name, ' ', gst.name, ' ', gp.capacity, ' ', gp.measurement_unit) AS product_name,
+        COUNT(c.id) FILTER (WHERE c.status = 'available') AS available_count,
+        COUNT(c.id) FILTER (WHERE c.status = 'dispatched') AS dispatched_count,
+        COUNT(c.id) AS total_count
+      FROM cylinders c
+      JOIN gas_products gp ON c.gas_product_id = gp.id
+      JOIN gas_sub_types gst ON gp.gas_sub_type_id = gst.id
+      JOIN gas_types gt ON gst.gas_type_id = gt.id
+      GROUP BY gp.id, product_name
+      ORDER BY product_name;
+    `;
+    const result = await pool.query(query);
+    res.json(result.rows);
+  } catch (error) {
+    console.error("Inventory Summary Error:", error);
+    res.status(500).json({ error: "Database error", details: error.message });
+  }
+});
+
 // Delete a gas product
 app.delete("/admin/delete-product/:id", authenticateJWT, async (req, res) => {
   const { id } = req.params;
