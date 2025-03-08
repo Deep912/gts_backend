@@ -727,78 +727,56 @@ app.post("/admin/update-cylinder-status", authenticateJWT, async (req, res) => {
   );
   res.json({ message: "Status updated successfully!" });
 });
-
 app.post("/admin/add-cylinder", authenticateJWT, async (req, res) => {
+  // Destructure the new required fields from the request body.
+  // Note: We no longer need gas_type_id, gas_sub_type_id, size, product_grade, capacity, or measurement_unit.
+  // Instead, we require a gas_product_id (which contains all that info) and manufacture_date.
   const {
     serial_number,
-    gas_sub_type_id, // 🔹 Updated: Using sub-type ID instead of gas_type
-    size,
+    gas_product_id,
+    manufacture_date,
     status,
     company_id,
-    product_grade,
-    capacity,
-    measurement_unit,
   } = req.body;
 
-  // ✅ Validate gas_sub_type_id: Ensure it exists in the database
-  try {
-    const gasCheck = await pool.query(
-      "SELECT id FROM gas_sub_types WHERE id = $1",
-      [gas_sub_type_id]
-    );
-    if (gasCheck.rows.length === 0) {
-      return res.status(400).json({ error: "Invalid gas sub-type ID" });
-    }
-  } catch (error) {
-    return res
-      .status(500)
-      .json({ error: "Database error", details: error.message });
-  }
-
-  // ✅ Validate capacity: Ensure it's a positive number
-  if (!capacity || isNaN(capacity) || capacity <= 0) {
-    return res.status(400).json({ error: "Invalid capacity value" });
-  }
-
-  // ✅ Validate measurement unit: Ensure it's one of the expected units
-  const allowedUnits = ["L", "KG", "m³"]; // Define valid units
-  if (!allowedUnits.includes(measurement_unit)) {
+  // Validate required fields.
+  if (!serial_number || !gas_product_id || !manufacture_date || !status) {
     return res
       .status(400)
-      .json({ error: "Invalid measurement unit. Allowed: L, KG, m³" });
+      .json({
+        error:
+          "Missing required fields: serial_number, gas_product_id, manufacture_date, status",
+      });
   }
 
   try {
+    // Insert into the updated cylinders table.
+    // The table now references gas_product_id and stores manufacture_date instead of the individual gas details.
     await pool.query(
       `INSERT INTO cylinders 
-       (serial_number, gas_sub_type_id, size, status, last_updated, company_id, product_grade, capacity, measurement_unit) 
-       VALUES ($1, $2, $3, $4, NOW(), $5, $6, $7, $8)`,
+       (serial_number, gas_product_id, manufacture_date, status, company_id, created_at, updated_at)
+       VALUES ($1, $2, $3, $4, $5, NOW(), NOW())`,
       [
         serial_number,
-        gas_sub_type_id, // 🔹 Updated: Using sub-type ID instead of gas_type
-        size,
+        gas_product_id,
+        manufacture_date,
         status,
-        company_id,
-        product_grade,
-        capacity,
-        measurement_unit,
+        company_id || null, // Allow NULL if no company is assigned initially.
       ]
     );
 
-    // 1️⃣ Log the event
+    // Log the event with the new cylinder details.
     await logEvent("add_cylinder", req.user.id, {
       serial_number,
-      gas_sub_type_id, // 🔹 Updated: Using sub-type ID instead of gas_type
-      size,
+      gas_product_id,
+      manufacture_date,
       status,
       company_id,
-      product_grade,
-      capacity,
-      measurement_unit,
     });
 
     res.json({ message: "Cylinder added successfully!" });
   } catch (error) {
+    console.error("Database Insert Error:", error);
     res.status(500).json({ error: "Database error", details: error.message });
   }
 });
@@ -1360,15 +1338,15 @@ app.get("/admin/reports/detailed", authenticateJWT, async (req, res) => {
 app.get("/admin/gas-types", authenticateJWT, async (req, res) => {
   try {
     const result = await pool.query(
-      "SELECT DISTINCT gas_type FROM cylinders ORDER BY gas_type"
+      "SELECT id, name FROM gas_types ORDER BY name"
     );
-    // Return only the gas_type values as an array
-    res.json(result.rows.map((row) => row.gas_type));
+    res.json(result.rows);
   } catch (error) {
     console.error("Error fetching gas types:", error);
     res.status(500).json({ error: "Database error", details: error.message });
   }
 });
+
 // Endpoint to add a new user (worker or admin)
 app.post("/admin/add-user", authenticateJWT, async (req, res) => {
   // Optional: Verify that the requester is an admin
