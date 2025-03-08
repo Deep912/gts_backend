@@ -741,12 +741,10 @@ app.post("/admin/add-cylinder", authenticateJWT, async (req, res) => {
 
   // Validate required fields.
   if (!serial_number || !gas_product_id || !manufacture_date || !status) {
-    return res
-      .status(400)
-      .json({
-        error:
-          "Missing required fields: serial_number, gas_product_id, manufacture_date, status",
-      });
+    return res.status(400).json({
+      error:
+        "Missing required fields: serial_number, gas_product_id, manufacture_date, status",
+    });
   }
 
   try {
@@ -1347,6 +1345,145 @@ app.get("/admin/gas-types", authenticateJWT, async (req, res) => {
   }
 });
 
+app.put("/admin/update-gas-type", authenticateJWT, async (req, res) => {
+  const { id, name } = req.body;
+  if (!id || !name) {
+    return res.status(400).json({ error: "id and name are required" });
+  }
+  try {
+    const result = await pool.query(
+      "UPDATE gas_types SET name = $1, updated_at = NOW() WHERE id = $2 RETURNING *",
+      [name, id]
+    );
+    res.json({
+      message: "Gas type updated successfully",
+      gas_type: result.rows[0],
+    });
+  } catch (error) {
+    console.error("Error updating gas type:", error);
+    res.status(500).json({ error: "Database error", details: error.message });
+  }
+});
+
+app.delete("/admin/delete-gas-type", authenticateJWT, async (req, res) => {
+  const { id } = req.body;
+  if (!id) {
+    return res.status(400).json({ error: "id is required" });
+  }
+  try {
+    await pool.query("DELETE FROM gas_types WHERE id = $1", [id]);
+    res.json({ message: "Gas type deleted successfully" });
+  } catch (error) {
+    console.error("Error deleting gas type:", error);
+    res.status(500).json({ error: "Database error", details: error.message });
+  }
+});
+
+app.put("/admin/update-gas-sub-type", authenticateJWT, async (req, res) => {
+  const { id, name } = req.body;
+  if (!id || !name) {
+    return res.status(400).json({ error: "id and name are required" });
+  }
+  try {
+    const result = await pool.query(
+      "UPDATE gas_sub_types SET name = $1, updated_at = NOW() WHERE id = $2 RETURNING *",
+      [name, id]
+    );
+    res.json({
+      message: "Gas sub type updated successfully",
+      gas_sub_type: result.rows[0],
+    });
+  } catch (error) {
+    console.error("Error updating gas sub type:", error);
+    res.status(500).json({ error: "Database error", details: error.message });
+  }
+});
+
+app.delete("/admin/delete-gas-sub-type", authenticateJWT, async (req, res) => {
+  const { id } = req.body;
+  if (!id) {
+    return res.status(400).json({ error: "id is required" });
+  }
+  try {
+    await pool.query("DELETE FROM gas_sub_types WHERE id = $1", [id]);
+    res.json({ message: "Gas sub type deleted successfully" });
+  } catch (error) {
+    console.error("Error deleting gas sub type:", error);
+    res.status(500).json({ error: "Database error", details: error.message });
+  }
+});
+
+app.get("/admin/gas-products", authenticateJWT, async (req, res) => {
+  try {
+    const result = await pool.query(
+      `
+      SELECT 
+        gp.id, 
+        CONCAT(gt.name, ' ', gst.name, ' ', gp.capacity, ' ', gp.measurement_unit) AS label
+      FROM gas_products gp
+      JOIN gas_sub_types gst ON gp.gas_sub_type_id = gst.id
+      JOIN gas_types gt ON gst.gas_type_id = gt.id
+      ORDER BY label
+      `
+    );
+    res.json(result.rows);
+  } catch (error) {
+    console.error("Error fetching gas products:", error);
+    res.status(500).json({ error: "Database error", details: error.message });
+  }
+});
+
+// Add this new endpoint in your Express server code:
+app.get("/admin/products", authenticateJWT, async (req, res) => {
+  try {
+    // Adjust the query as needed. Here we're fetching all rows from the gas_products table.
+    const result = await pool.query(
+      "SELECT * FROM gas_products ORDER BY created_at DESC"
+    );
+    res.json(result.rows);
+  } catch (error) {
+    console.error("Error fetching admin products:", error);
+    res.status(500).json({ error: "Database error", details: error.message });
+  }
+});
+
+app.get("/admin/gas-sub-types", authenticateJWT, async (req, res) => {
+  try {
+    const result = await pool.query("SELECT * FROM gas_sub_types ORDER BY id");
+    res.json(result.rows);
+  } catch (error) {
+    console.error("Error fetching gas sub types:", error);
+    res.status(500).json({ error: "Database error", details: error.message });
+  }
+});
+
+// Endpoint to fetch gas products filtered by gas_type_id
+app.get("/admin/gas-products", authenticateJWT, async (req, res) => {
+  const { gas_type_id } = req.query;
+  if (!gas_type_id) {
+    return res.status(400).json({ error: "gas_type_id is required" });
+  }
+  try {
+    const result = await pool.query(
+      `
+      SELECT 
+        gp.id, 
+        CONCAT(gt.name, ' ', gst.name, ' ', gp.capacity, ' ', gp.measurement_unit) AS label
+      FROM gas_products gp
+      JOIN gas_sub_types gst ON gp.gas_sub_type_id = gst.id
+      JOIN gas_types gt ON gst.gas_type_id = gt.id
+      WHERE gt.id = $1
+      ORDER BY label
+      `,
+      [gas_type_id]
+    );
+    res.json(result.rows);
+  } catch (error) {
+    console.error("Error fetching gas products:", error);
+    res.status(500).json({ error: "Database error", details: error.message });
+  }
+});
+
 // Endpoint to add a new user (worker or admin)
 app.post("/admin/add-user", authenticateJWT, async (req, res) => {
   // Optional: Verify that the requester is an admin
@@ -1448,6 +1585,101 @@ app.get("/admin/audit-logs", authenticateJWT, async (req, res) => {
     res.json(result.rows);
   } catch (error) {
     console.error("Error fetching audit logs:", error);
+    res.status(500).json({ error: "Database error", details: error.message });
+  }
+});
+
+//product manuplection
+
+app.post("/admin/add-gas-type", authenticateJWT, async (req, res) => {
+  const { name } = req.body;
+
+  if (!name) {
+    return res.status(400).json({ error: "Gas type name is required" });
+  }
+
+  try {
+    const result = await pool.query(
+      `INSERT INTO gas_types (name, created_at) 
+       VALUES ($1, NOW()) RETURNING *`,
+      [name]
+    );
+    res.json({
+      message: "Gas type added successfully",
+      gas_type: result.rows[0],
+    });
+  } catch (error) {
+    console.error("Error adding gas type:", error);
+    res.status(500).json({ error: "Database error", details: error.message });
+  }
+});
+
+app.post("/admin/add-gas-sub-type", authenticateJWT, async (req, res) => {
+  const { gas_type_id, name } = req.body;
+
+  if (!gas_type_id || !name) {
+    return res
+      .status(400)
+      .json({ error: "Gas type ID and sub type name are required" });
+  }
+
+  try {
+    const result = await pool.query(
+      `INSERT INTO gas_sub_types (gas_type_id, name, created_at)
+       VALUES ($1, $2, NOW()) RETURNING *`,
+      [gas_type_id, name]
+    );
+    res.json({
+      message: "Gas sub type added successfully",
+      gas_sub_type: result.rows[0],
+    });
+  } catch (error) {
+    console.error("Error adding gas sub type:", error);
+    res.status(500).json({ error: "Database error", details: error.message });
+  }
+});
+
+app.post("/admin/add-product", authenticateJWT, async (req, res) => {
+  const { gas_sub_type_id, capacity, measurement_unit, description } = req.body;
+
+  if (!gas_sub_type_id || !capacity || !measurement_unit) {
+    return res.status(400).json({
+      error:
+        "Missing required fields: gas_sub_type_id, capacity, measurement_unit",
+    });
+  }
+
+  try {
+    // Retrieve the gas sub type name for computing the product name.
+    const gasSubTypeResult = await pool.query(
+      "SELECT name FROM gas_sub_types WHERE id = $1",
+      [gas_sub_type_id]
+    );
+    if (gasSubTypeResult.rows.length === 0) {
+      return res.status(400).json({ error: "Invalid gas_sub_type_id" });
+    }
+
+    const gasSubTypeName = gasSubTypeResult.rows[0].name;
+    // Compute the product name (e.g., "TypeName 50L")
+    const computedName = `${gasSubTypeName} ${capacity}${measurement_unit}`;
+
+    const result = await pool.query(
+      `INSERT INTO gas_products (gas_sub_type_id, capacity, measurement_unit, description, name, created_at)
+       VALUES ($1, $2, $3, $4, $5, NOW()) RETURNING *`,
+      [
+        gas_sub_type_id,
+        capacity,
+        measurement_unit,
+        description || "",
+        computedName,
+      ]
+    );
+    res.json({
+      message: "Gas product added successfully",
+      gas_product: result.rows[0],
+    });
+  } catch (error) {
+    console.error("Error adding gas product:", error);
     res.status(500).json({ error: "Database error", details: error.message });
   }
 });
