@@ -1788,6 +1788,34 @@ app.post("/admin/add-product", authenticateJWT, async (req, res) => {
   }
 });
 
+// Daily Stock Report JSON Endpoint
+app.get("/admin/stock-report", authenticateJWT, async (req, res) => {
+  try {
+    const query = `
+      SELECT 
+        gp.id,
+        CONCAT(gt.name, ' ', gst.name, ' ', gp.capacity, ' ', gp.measurement_unit) AS product_name,
+        COUNT(c.id) AS stock_count
+      FROM cylinders c
+      JOIN gas_products gp ON c.gas_product_id = gp.id
+      JOIN gas_sub_types gst ON gp.gas_sub_type_id = gst.id
+      JOIN gas_types gt ON gst.gas_type_id = gt.id
+      GROUP BY gp.id, product_name
+      ORDER BY product_name;
+    `;
+    const result = await pool.query(query);
+    const report = result.rows.map((row) => ({
+      product_name: row.product_name,
+      yesterday_closing: row.stock_count, // Placeholder for actual yesterday's closing stock
+      today_opening: row.stock_count, // Placeholder for actual today's opening stock
+    }));
+    res.json(report);
+  } catch (error) {
+    console.error("Error fetching stock report:", error);
+    res.status(500).json({ error: "Database error", details: error.message });
+  }
+});
+
 // Start the server
 const PORT = process.env.PORT || 5000;
 app.listen(PORT, "0.0.0.0", () =>
