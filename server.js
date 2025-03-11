@@ -213,17 +213,16 @@ app.get("/worker/transactions", authenticateJWT, async (req, res) => {
 });
 
 app.post("/dispatch-cylinder", authenticateJWT, async (req, res) => {
-  const { serialNumbers, companyId, selectedProduct, quantity } = req.body;
+  const { serialNumbers, companyId, gas_product_id, quantity } = req.body;
 
-  console.log("Received Dispatch Data:", req.body); // Debugging
+  console.log("Received Dispatch Data:", req.body);
 
   if (!Array.isArray(serialNumbers) || serialNumbers.length === 0) {
     return res
       .status(400)
       .json({ error: "Invalid request. Provide an array of serial numbers." });
   }
-
-  if (!companyId || !selectedProduct || !quantity) {
+  if (!companyId || !gas_product_id || !quantity) {
     return res.status(400).json({ error: "Missing required fields." });
   }
 
@@ -237,12 +236,11 @@ app.post("/dispatch-cylinder", authenticateJWT, async (req, res) => {
       return res.status(400).json({ error: "Invalid company ID" });
     }
 
-    // Debugging: Check if serial numbers exist in the database
+    // Check if serial numbers exist in the database
     const checkCylinders = await pool.query(
       "SELECT serial_number FROM cylinders WHERE serial_number = ANY($1::text[])",
       [serialNumbers]
     );
-
     if (checkCylinders.rows.length !== serialNumbers.length) {
       return res.status(400).json({
         error: "Some cylinders are not found in the database",
@@ -253,7 +251,7 @@ app.post("/dispatch-cylinder", authenticateJWT, async (req, res) => {
       });
     }
 
-    // Dispatch the cylinders
+    // Dispatch the cylinders: update status to 'dispatched' and assign the company ID.
     await pool.query(
       `UPDATE cylinders 
        SET status = 'dispatched', company_id = $1 
@@ -261,7 +259,7 @@ app.post("/dispatch-cylinder", authenticateJWT, async (req, res) => {
       [companyId, serialNumbers]
     );
 
-    // Log Transaction
+    // Log the dispatch transaction.
     await pool.query(
       `INSERT INTO transactions (user_id, cylinder_id, action, company_id) 
        SELECT $1, id, 'dispatch', $2 FROM cylinders WHERE serial_number = ANY($3::text[])`,
@@ -277,15 +275,28 @@ app.post("/dispatch-cylinder", authenticateJWT, async (req, res) => {
 
 app.get("/products", authenticateJWT, async (req, res) => {
   try {
-    const result = await pool.query(
-      "SELECT DISTINCT gas_type || ' ' || size AS product FROM cylinders WHERE status = 'available'"
-    );
-    res.json(result.rows.map((row) => row.product));
+    const query = `
+      SELECT 
+        gp.id, 
+        gp.gas_sub_type_id,
+        gp.capacity,
+        gp.measurement_unit,
+        gp.description,
+        gp.created_at,
+        CONCAT(gt.name, ' ', gst.name, ' ', gp.capacity, ' ', gp.measurement_unit) AS label
+      FROM gas_products gp
+      JOIN gas_sub_types gst ON gp.gas_sub_type_id = gst.id
+      JOIN gas_types gt ON gst.gas_type_id = gt.id
+      ORDER BY gp.created_at DESC;
+    `;
+    const result = await pool.query(query);
+    res.json(result.rows);
   } catch (error) {
-    console.error("Product Fetch Error:", error);
+    console.error("Error fetching admin products:", error);
     res.status(500).json({ error: "Database error", details: error.message });
   }
 });
+
 app.get("/companies", authenticateJWT, async (req, res) => {
   try {
     const result = await pool.query("SELECT * FROM companies ORDER BY name");
@@ -313,18 +324,22 @@ app.get("/test-db", async (req, res) => {
 });
 
 app.get("/available-cylinders", authenticateJWT, async (req, res) => {
-  const { product } = req.query;
+  const { gas_product_id } = req.query;
 
-  if (!product) {
-    return res.status(400).json({ error: "Product type is required" });
+  if (!gas_product_id) {
+    return res.status(400).json({ error: "Gas product id is required" });
   }
 
   try {
-    const result = await pool.query(
-      "SELECT serial_number, gas_type, size FROM cylinders WHERE status = 'available' AND gas_type || ' ' || size = $1",
-      [product]
-    );
-
+    const query = `
+      SELECT c.serial_number, gt.name AS gas_type, c.manufacture_date
+      FROM cylinders c
+      JOIN gas_products gp ON c.gas_product_id = gp.id
+      JOIN gas_sub_types gst ON gp.gas_sub_type_id = gst.id
+      JOIN gas_types gt ON gst.gas_type_id = gt.id
+      WHERE c.status = 'available' AND gp.id = $1
+    `;
+    const result = await pool.query(query, [gas_product_id]);
     res.json(result.rows);
   } catch (error) {
     console.error("Available Cylinders Fetch Error:", error);
@@ -334,15 +349,22 @@ app.get("/available-cylinders", authenticateJWT, async (req, res) => {
 
 app.get("/dispatched-cylinders", authenticateJWT, async (req, res) => {
   const { companyId } = req.query;
-
   if (!companyId) {
     return res.status(400).json({ error: "Company ID is required" });
   }
-
   try {
     const result = await pool.query(
-      "SELECT serial_number, gas_type, size FROM cylinders WHERE company_id = $1 AND status = 'dispatched'",
-      [companyId]
+      `
+      SELECT 
+        c.serial_number,
+        CONCAT(gt.name, ' ', gst.name, ' ', gp.capacity, ' ', gp.measurement_unit) AS product_label
+      FROM cylinders c
+      JOIN gas_products gp ON c.gas_product_id = gp.id
+      JOIN gas_sub_types gst ON gp.gas_sub_type_id = gst.id
+      JOIN gas_types gt ON gst.gas_type_id = gt.id
+      WHERE c.company_id = $1 AND c.status = 'dispatched'
+      `,
+      [Number(companyId)]
     );
     res.json(result.rows);
   } catch (error) {
@@ -409,7 +431,7 @@ app.post("/refill-cylinder", authenticateJWT, async (req, res) => {
   }
 
   try {
-    // 🔹 Ensure all cylinders are EMPTY before refilling
+    // Ensure all cylinders are EMPTY before refilling
     const checkStatus = await pool.query(
       "SELECT serial_number FROM cylinders WHERE serial_number = ANY($1::text[]) AND status != 'empty'",
       [cylinderIds]
@@ -423,13 +445,13 @@ app.post("/refill-cylinder", authenticateJWT, async (req, res) => {
       });
     }
 
-    // 🔹 Update status to 'refilling'
+    // Update status to 'refilling'
     await pool.query(
       "UPDATE cylinders SET status = 'refilling' WHERE serial_number = ANY($1::text[])",
       [cylinderIds]
     );
 
-    // 🔹 Log the transaction
+    // Log the transaction
     await pool.query(
       `INSERT INTO transactions (user_id, cylinder_id, action) 
        SELECT $1, id, 'refill' FROM cylinders WHERE serial_number = ANY($2::text[])`,
@@ -442,11 +464,23 @@ app.post("/refill-cylinder", authenticateJWT, async (req, res) => {
     res.status(500).json({ error: "Database error", details: error.message });
   }
 });
+
 app.get("/refilling-cylinders", authenticateJWT, async (req, res) => {
   try {
-    const result = await pool.query(
-      "SELECT serial_number, gas_type, size FROM cylinders WHERE status = 'refilling'"
-    );
+    const query = `
+      SELECT 
+        c.serial_number,
+        CONCAT(gt.name, ' ', gst.name, ' ', gp.capacity, ' ', gp.measurement_unit) AS product_label,
+        c.manufacture_date,
+        c.status
+      FROM cylinders c
+      JOIN gas_products gp ON c.gas_product_id = gp.id
+      JOIN gas_sub_types gst ON gp.gas_sub_type_id = gst.id
+      JOIN gas_types gt ON gst.gas_type_id = gt.id
+      WHERE c.status = 'refilling'
+      ORDER BY c.serial_number;
+    `;
+    const result = await pool.query(query);
     res.json(result.rows);
   } catch (error) {
     console.error("Error fetching refilling cylinders:", error);
@@ -476,7 +510,7 @@ app.post("/complete-refill", authenticateJWT, async (req, res) => {
       });
     }
 
-    // Update status to 'available'
+    // Update status to 'available' (or 'refilled')
     await pool.query(
       "UPDATE cylinders SET status = 'available' WHERE serial_number = ANY($1::text[])",
       [cylinderIds]
@@ -503,16 +537,24 @@ app.get("/empty-cylinders", authenticateJWT, async (req, res) => {
 
 app.get("/empty-cylinders-grouped", authenticateJWT, async (req, res) => {
   try {
-    const result = await pool.query(
-      `SELECT gas_type, size, json_agg(json_build_object(
-        'serial_number', serial_number
-      )) AS cylinders
-      FROM cylinders 
-      WHERE status = 'empty'
-      GROUP BY gas_type, size
-      ORDER BY gas_type, size`
-    );
-
+    const query = `
+      SELECT 
+        CONCAT(gt.name, ' ', gst.name, ' ', gp.capacity, ' ', gp.measurement_unit) AS product_label,
+        json_agg(
+          json_build_object(
+            'serial_number', c.serial_number,
+            'manufacture_date', c.manufacture_date
+          )
+        ) AS cylinders
+      FROM cylinders c
+      JOIN gas_products gp ON c.gas_product_id = gp.id
+      JOIN gas_sub_types gst ON gp.gas_sub_type_id = gst.id
+      JOIN gas_types gt ON gst.gas_type_id = gt.id
+      WHERE c.status = 'empty'
+      GROUP BY product_label
+      ORDER BY product_label;
+    `;
+    const result = await pool.query(query);
     res.json(result.rows);
   } catch (error) {
     console.error("Fetch Empty Cylinders Error:", error);
@@ -1262,110 +1304,103 @@ app.get("/admin/reports/combined", authenticateJWT, async (req, res) => {
       productType,
     } = req.query;
     let values = [];
-
-    // Build the base query for transactions with joins for extra info:
-    let transactionsQuery = `
+    let query = `
       SELECT 
-        t.cylinder_id, 
-        t.action, 
-        u.username AS performed_by, 
+        t.id AS transaction_id,
+        t.action,
+        u.username AS performed_by,
         t.timestamp,
-        c.gas_type,
+        CONCAT(gt.name, ' ', gst.name, ' ', gp.capacity, ' ', gp.measurement_unit) AS product_label,
         comp.name AS company_name
       FROM transactions t
-      JOIN users u ON t.user_id = u.id
+      LEFT JOIN users u ON t.user_id = u.id
       LEFT JOIN cylinders c ON t.cylinder_id = c.id
+      LEFT JOIN gas_products gp ON c.gas_product_id = gp.id
+      LEFT JOIN gas_sub_types gst ON gp.gas_sub_type_id = gst.id
+      LEFT JOIN gas_types gt ON gst.gas_type_id = gt.id
       LEFT JOIN companies comp ON t.company_id = comp.id
-      WHERE 1 = 1
+      WHERE 1=1
     `;
 
     // Date range filter
     if (start && end) {
-      transactionsQuery += ` AND t.timestamp BETWEEN $${
-        values.length + 1
-      } AND $${values.length + 2}`;
+      query += ` AND t.timestamp BETWEEN $${values.length + 1} AND $${
+        values.length + 2
+      }`;
       values.push(start, end);
     }
 
-    // Search filter for cylinder_id or action (or even username)
+    // Search filter (applied to cylinder, action, or worker)
     if (search) {
-      transactionsQuery += ` AND (CAST(t.cylinder_id AS TEXT) LIKE $${
-        values.length + 1
-      } OR LOWER(t.action) LIKE LOWER($${
-        values.length + 1
-      }) OR LOWER(u.username) LIKE LOWER($${values.length + 1}))`;
+      query += ` AND (CAST(t.id AS TEXT) ILIKE $${values.length + 1}
+                   OR LOWER(t.action) ILIKE LOWER($${values.length + 1})
+                   OR LOWER(u.username) ILIKE LOWER($${values.length + 1}))`;
       values.push(`%${search}%`);
     }
 
-    // Gas type filter
+    // Gas type filter (applied to the computed product label)
     if (gasType) {
-      transactionsQuery += ` AND c.gas_type ILIKE $${values.length + 1}`;
+      query += ` AND gt.name ILIKE $${values.length + 1}`;
       values.push(`%${gasType}%`);
     }
 
-    // Product type filter (if product type is stored or derived from cylinders)
+    // Product type filter (applied to computed product label)
     if (productType) {
-      // Adjust this condition if product type is derived from a combination (e.g. gas_type || ' ' || size)
-      transactionsQuery += ` AND (c.gas_type || ' ' || c.size) ILIKE $${
+      query += ` AND (CONCAT(gt.name, ' ', gst.name, ' ', gp.capacity, ' ', gp.measurement_unit)) ILIKE $${
         values.length + 1
       }`;
       values.push(`%${productType}%`);
     }
 
-    // Company filter (by company name)
+    // Company filter
     if (company) {
-      transactionsQuery += ` AND comp.name ILIKE $${values.length + 1}`;
+      query += ` AND comp.name ILIKE $${values.length + 1}`;
       values.push(`%${company}%`);
     }
 
-    // Worker filter (by username)
+    // Worker filter
     if (worker) {
-      transactionsQuery += ` AND u.username ILIKE $${values.length + 1}`;
+      query += ` AND u.username ILIKE $${values.length + 1}`;
       values.push(`%${worker}%`);
     }
 
-    // Sorting logic (allow sorting by a set of allowed columns)
+    // Sorting logic
     const allowedSortColumns = [
-      "cylinder_id",
+      "transaction_id",
       "timestamp",
       "action",
-      "gas_type",
+      "product_label",
       "company_name",
       "performed_by",
     ];
     if (sortBy && allowedSortColumns.includes(sortBy)) {
-      transactionsQuery += ` ORDER BY ${sortBy} ${
-        sortOrder === "desc" ? "DESC" : "ASC"
-      }`;
+      query += ` ORDER BY ${sortBy} ${sortOrder === "desc" ? "DESC" : "ASC"}`;
     } else {
-      transactionsQuery += ` ORDER BY t.timestamp DESC`;
+      query += ` ORDER BY t.timestamp DESC`;
     }
 
-    // Execute the transactions query
-    const transactionsResult = await pool.query(transactionsQuery, values);
+    const transactionsResult = await pool.query(query, values);
 
-    // Build summary queries
+    // Build summary queries (for total, unique cylinders, etc.)
     const summaryQuery = `
       SELECT 
         COUNT(*) AS total_transactions, 
         COUNT(DISTINCT cylinder_id) AS unique_cylinders, 
         MAX(timestamp) AS latest_activity
-      FROM transactions
+      FROM transactions;
     `;
     const actionBreakdownQuery = `
       SELECT action, COUNT(*) AS count 
       FROM transactions 
       GROUP BY action 
-      ORDER BY count DESC
+      ORDER BY count DESC;
     `;
 
-    // Execute summary queries in parallel if desired:
     const [summaryResult, actionBreakdownResult] = await Promise.all([
       pool.query(summaryQuery),
       pool.query(actionBreakdownQuery),
     ]);
 
-    // Prepare the summary object
     const summary = {
       total_transactions: summaryResult.rows[0].total_transactions,
       unique_cylinders: summaryResult.rows[0].unique_cylinders,
@@ -1373,7 +1408,6 @@ app.get("/admin/reports/combined", authenticateJWT, async (req, res) => {
       action_breakdown: actionBreakdownResult.rows,
     };
 
-    // Send combined response
     res.json({
       transactions: transactionsResult.rows,
       summary,
@@ -1383,17 +1417,139 @@ app.get("/admin/reports/combined", authenticateJWT, async (req, res) => {
     res.status(500).json({ error: "Database error", details: error.message });
   }
 });
+
 // Endpoint for product types (if product type is a combination of gas_type and size)
 app.get("/admin/product-types", authenticateJWT, async (req, res) => {
   try {
-    // If product type is defined as "gas_type size", adjust if needed
     const result = await pool.query(
-      "SELECT DISTINCT (gas_type || ' ' || size) AS product_type FROM cylinders ORDER BY product_type"
+      `
+      SELECT DISTINCT 
+        (gt.name || ' ' || gst.name || ' ' || gp.capacity || ' ' || gp.measurement_unit) AS product_type
+      FROM cylinders c
+      JOIN gas_products gp ON c.gas_product_id = gp.id
+      JOIN gas_sub_types gst ON gp.gas_sub_type_id = gst.id
+      JOIN gas_types gt ON gst.gas_type_id = gt.id
+      ORDER BY product_type;
+      `
     );
     // Return only the product_type values as an array
     res.json(result.rows.map((row) => row.product_type));
   } catch (error) {
     console.error("Error fetching product types:", error);
+    res.status(500).json({ error: "Database error", details: error.message });
+  }
+});
+
+app.get("/admin/reports/gas-sub-type", authenticateJWT, async (req, res) => {
+  const { gasSubType } = req.query;
+  if (!gasSubType) {
+    return res
+      .status(400)
+      .json({ error: "gasSubType query parameter is required" });
+  }
+
+  // Define a low-stock threshold if needed; here it is 5.
+  const LOW_STOCK_THRESHOLD = 5;
+
+  try {
+    const query = `
+      SELECT 
+        gst.name AS gas_sub_type,
+        COUNT(c.id) AS total_cylinders,
+        COUNT(c.id) FILTER (WHERE c.status = 'available') AS available_count,
+        COUNT(c.id) FILTER (WHERE c.status = 'dispatched') AS dispatched_count,
+        COUNT(c.id) FILTER (WHERE c.status = 'refilling') AS refilling_count,
+        COUNT(c.id) FILTER (WHERE c.status = 'empty') AS empty_count,
+        CASE 
+          WHEN COUNT(c.id) FILTER (WHERE c.status = 'available') < $2 THEN 'Reorder Now'
+          ELSE '-'
+        END AS reorder_recommendation
+      FROM cylinders c
+      JOIN gas_products gp ON c.gas_product_id = gp.id
+      JOIN gas_sub_types gst ON gp.gas_sub_type_id = gst.id
+      WHERE gst.name ILIKE $1
+      GROUP BY gst.name
+      ORDER BY gst.name;
+    `;
+    const result = await pool.query(query, [
+      `%${gasSubType}%`,
+      LOW_STOCK_THRESHOLD,
+    ]);
+    res.json(result.rows);
+  } catch (error) {
+    console.error("Error fetching gas sub type report", error);
+    res.status(500).json({ error: "Database error", details: error.message });
+  }
+});
+
+app.get("/admin/reports/gas-type", authenticateJWT, async (req, res) => {
+  const { gasType } = req.query;
+  if (!gasType) {
+    return res
+      .status(400)
+      .json({ error: "gasType query parameter is required" });
+  }
+  try {
+    const query = `
+      SELECT 
+        gt.name as gas_type,
+        COUNT(c.id) AS total_cylinders,
+        COUNT(c.id) FILTER (WHERE c.status = 'available') AS available_count,
+        COUNT(c.id) FILTER (WHERE c.status = 'dispatched') AS dispatched_count,
+        COUNT(c.id) FILTER (WHERE c.status = 'refilling') AS refilling_count,
+        COUNT(c.id) FILTER (WHERE c.status = 'empty') AS empty_count
+      FROM cylinders c
+      JOIN gas_products gp ON c.gas_product_id = gp.id
+      JOIN gas_sub_types gst ON gp.gas_sub_type_id = gst.id
+      JOIN gas_types gt ON gst.gas_type_id = gt.id
+      WHERE LOWER(gt.name) = LOWER($1)
+      GROUP BY gt.name;
+    `;
+    const result = await pool.query(query, [gasType]);
+    if (result.rows.length === 0) {
+      return res
+        .status(404)
+        .json({ error: "No data found for the specified gas type" });
+    }
+    res.json(result.rows[0]);
+  } catch (error) {
+    console.error("Error fetching gas type report:", error);
+    res.status(500).json({ error: "Database error", details: error.message });
+  }
+});
+
+app.get("/admin/reports/company-wise", authenticateJWT, async (req, res) => {
+  // Get start and end dates from query; if missing, default to last 1 month.
+  let { start, end } = req.query;
+  if (!start || !end) {
+    const now = new Date();
+    const oneMonthAgo = new Date();
+    oneMonthAgo.setMonth(now.getMonth() - 1);
+    start = oneMonthAgo.toISOString();
+    end = now.toISOString();
+  }
+  try {
+    const query = `
+      SELECT 
+        comp.id AS company_id,
+        comp.name AS company_name,
+        COUNT(t.id) AS total_transactions,
+        COUNT(CASE WHEN t.action = 'dispatch' THEN 1 END) AS dispatched,
+        COUNT(CASE WHEN t.action = 'receive_empty' THEN 1 END) AS received_empty,
+        COUNT(CASE WHEN t.action = 'receive_filled' THEN 1 END) AS received_filled,
+        COUNT(CASE WHEN t.action = 'refill' THEN 1 END) AS refilled,
+        COUNT(DISTINCT c.serial_number) AS unique_cylinders
+      FROM companies comp
+      LEFT JOIN transactions t ON comp.id = t.company_id
+      LEFT JOIN cylinders c ON t.cylinder_id = c.id
+      WHERE t.timestamp BETWEEN $1 AND $2
+      GROUP BY comp.id, comp.name
+      ORDER BY comp.name;
+    `;
+    const result = await pool.query(query, [start, end]);
+    res.json(result.rows);
+  } catch (error) {
+    console.error("Error fetching company-wise report:", error);
     res.status(500).json({ error: "Database error", details: error.message });
   }
 });
@@ -1540,10 +1696,21 @@ app.get("/admin/gas-products", authenticateJWT, async (req, res) => {
 // Add this new endpoint in your Express server code:
 app.get("/admin/products", authenticateJWT, async (req, res) => {
   try {
-    // Adjust the query as needed. Here we're fetching all rows from the gas_products table.
-    const result = await pool.query(
-      "SELECT * FROM gas_products ORDER BY created_at DESC"
-    );
+    const query = `
+      SELECT 
+        gp.id, 
+        gp.gas_sub_type_id,
+        gp.capacity,
+        gp.measurement_unit,
+        gp.description,
+        gp.created_at,
+        CONCAT(gt.name, ' ', gst.name, ' ', gp.capacity, ' ', gp.measurement_unit) AS label
+      FROM gas_products gp
+      JOIN gas_sub_types gst ON gp.gas_sub_type_id = gst.id
+      JOIN gas_types gt ON gst.gas_type_id = gt.id
+      ORDER BY gp.created_at DESC;
+    `;
+    const result = await pool.query(query);
     res.json(result.rows);
   } catch (error) {
     console.error("Error fetching admin products:", error);
