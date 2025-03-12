@@ -251,7 +251,7 @@ app.post("/dispatch-cylinder", authenticateJWT, async (req, res) => {
       });
     }
 
-    // Dispatch the cylinders: update status to 'dispatched' and assign the company ID.
+    // Update cylinders: set status to 'dispatched' and assign the company ID.
     await pool.query(
       `UPDATE cylinders 
        SET status = 'dispatched', company_id = $1 
@@ -261,17 +261,27 @@ app.post("/dispatch-cylinder", authenticateJWT, async (req, res) => {
 
     // Generate a chalan number using the last 4 digits of the timestamp and a random two-digit number.
     const timestampStr = Date.now().toString();
-    const randomPart = Math.floor(10 + Math.random() * 90); // random number between 10 and 99
+    const randomPart = Math.floor(10 + Math.random() * 90); // Random number between 10 and 99
     const chalanNumber = `CL-${timestampStr.slice(-4)}${randomPart}`;
 
-    // Log the dispatch transaction including the chalan number.
-    await pool.query(
-      `INSERT INTO transactions (user_id, cylinder_id, action, company_id, chalan_number) 
-       SELECT $1, id, 'dispatch', $2, $4 FROM cylinders WHERE serial_number = ANY($3::text[])`,
+    // Log the dispatch transaction and return the auto-generated id
+    const insertResult = await pool.query(
+      `INSERT INTO transactions (user_id, cylinder_id, action, company_id, chalan_number)
+       SELECT $1, id, 'dispatch', $2, $4
+       FROM cylinders
+       WHERE serial_number = ANY($3::text[])
+       RETURNING id`,
       [req.user.id, companyId, serialNumbers, chalanNumber]
     );
 
-    res.json({ message: "Cylinders dispatched successfully!", chalanNumber });
+    // Use the returned id as the transaction identifier (or combine it with your custom string)
+    const transactionId = `TXN-${insertResult.rows[0].id}`;
+
+    res.json({
+      message: "Cylinders dispatched successfully!",
+      transactionId,
+      chalanNumber,
+    });
   } catch (error) {
     console.error("Dispatch Error:", error);
     res.status(500).json({ error: "Database error", details: error.message });
