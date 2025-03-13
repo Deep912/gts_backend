@@ -192,31 +192,52 @@ app.get("/worker-transactions", authenticateJWT, async (req, res) => {
     res.status(500).json({ error: "Database error", details: error.message });
   }
 });
+
 app.get("/worker/transactions", authenticateJWT, async (req, res) => {
   try {
     const userId = req.user.id;
     const search = req.query.search || "";
+    const limit = parseInt(req.query.limit) || 10;
+    const offset = parseInt(req.query.offset) || 0;
 
-    let transactionsQuery = `
-      SELECT t.transaction_number, t.action, t.cylinder_id, c.name AS company_name, t.timestamp
+    // Build the base query including allowed actions and using performed_by column
+    let baseQuery = `
       FROM transactions t
       LEFT JOIN companies c ON t.company_id = c.id
       WHERE t.user_id = $1
+        AND LOWER(t.action) IN ('dispatch', 'receive_empty', 'receive_filled')
     `;
     const queryParams = [userId];
 
     if (search) {
-      transactionsQuery += " AND t.transaction_number ILIKE $2";
+      baseQuery += " AND ('TXN-' || t.id) ILIKE $2";
       queryParams.push(`%${search}%`);
     }
 
-    transactionsQuery += " ORDER BY t.timestamp DESC";
-    // Optionally, remove or adjust the LIMIT as needed:
-    // transactionsQuery += " LIMIT 50";
+    // Count total matching records for pagination
+    const countQuery = `SELECT COUNT(*) ${baseQuery}`;
+    const countResult = await pool.query(countQuery, queryParams);
+    const total = parseInt(countResult.rows[0].count);
 
-    const result = await pool.query(transactionsQuery, queryParams);
+    // Fetch the actual rows using limit and offset, ordered by t.id DESC
+    let dataQuery = `
+      SELECT 
+        ('TXN-' || t.id) AS transaction_number,
+        t.chalan_number,
+        t.action,
+        t.cylinder_id,
+        c.name AS company_name,
+        t.performed_by,
+        t.timestamp
+      ${baseQuery}
+      ORDER BY t.id DESC
+      LIMIT $${queryParams.length + 1} OFFSET $${queryParams.length + 2}
+    `;
+    queryParams.push(limit, offset);
 
-    res.json(result.rows);
+    const result = await pool.query(dataQuery, queryParams);
+
+    res.json({ total, rows: result.rows });
   } catch (error) {
     res.status(500).json({ error: "Database error", details: error.message });
   }
@@ -274,14 +295,14 @@ app.post("/dispatch-cylinder", authenticateJWT, async (req, res) => {
     const randomPart = Math.floor(10 + Math.random() * 90); // Random number between 10 and 99
     const chalanNumber = `CL-${timestampStr.slice(-4)}${randomPart}`;
 
-    // Log the dispatch transaction and return the auto-generated id
+    // Log the dispatch transaction and return the auto-generated id.
     const insertResult = await pool.query(
-      `INSERT INTO transactions (user_id, cylinder_id, action, company_id, chalan_number)
-       SELECT $1, id, 'dispatch', $2, $4
+      `INSERT INTO transactions (user_id, cylinder_id, action, company_id, chalan_number, performed_by)
+       SELECT $1, id, 'dispatch', $2, $4, $5
        FROM cylinders
        WHERE serial_number = ANY($3::text[])
        RETURNING id`,
-      [req.user.id, companyId, serialNumbers, chalanNumber]
+      [req.user.id, companyId, serialNumbers, chalanNumber, req.user.username]
     );
 
     // Use the returned id as the transaction identifier (or combine it with your custom string)
@@ -436,23 +457,29 @@ app.post("/receive-cylinder", authenticateJWT, async (req, res) => {
     // Generate a chalan number using the dispatch style ("CL-" prefix)
     const timestampStr = Date.now().toString();
     const randomPart = Math.floor(10 + Math.random() * 90); // random between 10 and 99
-    const chalanNumber = `CL-${timestampStr.slice(-4)}${randomPart}`;
+    const receiveChalanNumber = `CL-${timestampStr.slice(-4)}${randomPart}`;
 
     // Insert transaction records for all received cylinders using a single query.
     // The action is determined by the updated status in the cylinders table.
     const insertResult = await pool.query(
-      `INSERT INTO transactions (user_id, cylinder_id, action, company_id, chalan_number)
+      `INSERT INTO transactions (user_id, cylinder_id, action, company_id, chalan_number, performed_by)
        SELECT $1, id,
          CASE 
            WHEN status = 'empty' THEN 'receive_empty'
            WHEN status = 'available' THEN 'receive_filled'
            ELSE 'receive'
          END,
-         $2, $3
+         $2, $3, $4
        FROM cylinders
-       WHERE serial_number = ANY($4::text[])
+       WHERE serial_number = ANY($5::text[])
        RETURNING id`,
-      [req.user.id, companyId, chalanNumber, allSerialNumbers]
+      [
+        req.user.id,
+        companyId,
+        receiveChalanNumber,
+        req.user.username,
+        allSerialNumbers,
+      ]
     );
 
     // Use the returned id to create a transaction ID (like in your dispatch endpoint)
@@ -461,7 +488,7 @@ app.post("/receive-cylinder", authenticateJWT, async (req, res) => {
     res.json({
       message: "Cylinders received successfully!",
       transactionId,
-      chalanNumber,
+      chalanNumber: receiveChalanNumber,
     });
   } catch (error) {
     console.error("Receive Cylinder Error:", error);
