@@ -864,12 +864,18 @@ app.post("/admin/delete-cylinder", authenticateJWT, async (req, res) => {
 // Update a gas product
 app.put("/admin/update-product/:id", authenticateJWT, async (req, res) => {
   const { id } = req.params;
-  const { gas_sub_type_id, capacity, measurement_unit, description } = req.body;
+  const { gas_sub_type_id, capacity, measurement_unit, description, price } =
+    req.body;
 
-  if (!gas_sub_type_id || !capacity || !measurement_unit) {
+  if (
+    !gas_sub_type_id ||
+    !capacity ||
+    !measurement_unit ||
+    price === undefined
+  ) {
     return res.status(400).json({
       error:
-        "Missing required fields: gas_sub_type_id, capacity, measurement_unit",
+        "Missing required fields: gas_sub_type_id, capacity, measurement_unit, price",
     });
   }
 
@@ -887,16 +893,16 @@ app.put("/admin/update-product/:id", authenticateJWT, async (req, res) => {
     // Compute the product name (e.g., "Industrial 50L")
     const computedName = `${gasSubTypeName} ${capacity}${measurement_unit}`;
 
-    // Update the gas product record.
     const result = await pool.query(
       `UPDATE gas_products 
-       SET gas_sub_type_id = $1, capacity = $2, measurement_unit = $3, description = $4, name = $5
-       WHERE id = $6 RETURNING *`,
+       SET gas_sub_type_id = $1, capacity = $2, measurement_unit = $3, description = $4, price = $5, name = $6
+       WHERE id = $7 RETURNING *`,
       [
         gas_sub_type_id,
         capacity,
         measurement_unit,
         description || "",
+        price,
         computedName,
         id,
       ]
@@ -1519,23 +1525,27 @@ app.get("/admin/reports/combined", authenticateJWT, async (req, res) => {
 });
 
 // Endpoint for product types (if product type is a combination of gas_type and size)
-app.get("/admin/product-types", authenticateJWT, async (req, res) => {
+app.get("/admin/products", authenticateJWT, async (req, res) => {
   try {
-    const result = await pool.query(
-      `
-      SELECT DISTINCT 
-        (gt.name || ' ' || gst.name || ' ' || gp.capacity || ' ' || gp.measurement_unit) AS product_type
-      FROM cylinders c
-      JOIN gas_products gp ON c.gas_product_id = gp.id
+    const query = `
+      SELECT 
+        gp.id,  
+        gp.gas_sub_type_id,
+        gp.capacity,
+        gp.measurement_unit,
+        gp.description,
+        gp.created_at,
+        gp.price,
+        CONCAT(gt.name, ' ', gst.name, ' ', gp.capacity, ' ', gp.measurement_unit) AS label
+      FROM gas_products gp
       JOIN gas_sub_types gst ON gp.gas_sub_type_id = gst.id
       JOIN gas_types gt ON gst.gas_type_id = gt.id
-      ORDER BY product_type;
-      `
-    );
-    // Return only the product_type values as an array
-    res.json(result.rows.map((row) => row.product_type));
+      ORDER BY gp.created_at DESC;
+    `;
+    const result = await pool.query(query);
+    res.json(result.rows);
   } catch (error) {
-    console.error("Error fetching product types:", error);
+    console.error("Error fetching admin products:", error);
     res.status(500).json({ error: "Database error", details: error.message });
   }
 });
@@ -1991,12 +2001,18 @@ app.post("/admin/add-gas-sub-type", authenticateJWT, async (req, res) => {
 });
 
 app.post("/admin/add-product", authenticateJWT, async (req, res) => {
-  const { gas_sub_type_id, capacity, measurement_unit, description } = req.body;
+  const { gas_sub_type_id, capacity, measurement_unit, description, price } =
+    req.body;
 
-  if (!gas_sub_type_id || !capacity || !measurement_unit) {
+  if (
+    !gas_sub_type_id ||
+    !capacity ||
+    !measurement_unit ||
+    price === undefined
+  ) {
     return res.status(400).json({
       error:
-        "Missing required fields: gas_sub_type_id, capacity, measurement_unit",
+        "Missing required fields: gas_sub_type_id, capacity, measurement_unit, price",
     });
   }
 
@@ -2011,17 +2027,18 @@ app.post("/admin/add-product", authenticateJWT, async (req, res) => {
     }
 
     const gasSubTypeName = gasSubTypeResult.rows[0].name;
-    // Compute the product name (e.g., "TypeName 50L")
+    // Compute the product name (e.g., "Industrial 50L")
     const computedName = `${gasSubTypeName} ${capacity}${measurement_unit}`;
 
     const result = await pool.query(
-      `INSERT INTO gas_products (gas_sub_type_id, capacity, measurement_unit, description, name, created_at)
-       VALUES ($1, $2, $3, $4, $5, NOW()) RETURNING *`,
+      `INSERT INTO gas_products (gas_sub_type_id, capacity, measurement_unit, description, price, name, created_at)
+       VALUES ($1, $2, $3, $4, $5, $6, NOW()) RETURNING *`,
       [
         gas_sub_type_id,
         capacity,
         measurement_unit,
         description || "",
+        price,
         computedName,
       ]
     );
