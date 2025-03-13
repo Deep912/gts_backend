@@ -195,16 +195,26 @@ app.get("/worker-transactions", authenticateJWT, async (req, res) => {
 app.get("/worker/transactions", authenticateJWT, async (req, res) => {
   try {
     const userId = req.user.id;
+    const search = req.query.search || "";
 
-    const transactionsQuery = `
-      SELECT t.action, t.cylinder_id, c.name AS company_name, t.timestamp
+    let transactionsQuery = `
+      SELECT t.transaction_number, t.action, t.cylinder_id, c.name AS company_name, t.timestamp
       FROM transactions t
       LEFT JOIN companies c ON t.company_id = c.id
       WHERE t.user_id = $1
-      ORDER BY t.timestamp DESC
-      LIMIT 5
     `;
-    const result = await pool.query(transactionsQuery, [userId]);
+    const queryParams = [userId];
+
+    if (search) {
+      transactionsQuery += " AND t.transaction_number ILIKE $2";
+      queryParams.push(`%${search}%`);
+    }
+
+    transactionsQuery += " ORDER BY t.timestamp DESC";
+    // Optionally, remove or adjust the LIMIT as needed:
+    // transactionsQuery += " LIMIT 50";
+
+    const result = await pool.query(transactionsQuery, queryParams);
 
     res.json(result.rows);
   } catch (error) {
@@ -392,46 +402,67 @@ app.get("/dispatched-cylinders", authenticateJWT, async (req, res) => {
 app.post("/receive-cylinder", authenticateJWT, async (req, res) => {
   const { emptySerialNumbers, filledSerialNumbers, companyId } = req.body;
 
+  // Validate input: at least one list must be non-empty
   if (
-    !Array.isArray(emptySerialNumbers) ||
-    !Array.isArray(filledSerialNumbers) ||
-    (emptySerialNumbers.length === 0 && filledSerialNumbers.length === 0)
+    (!Array.isArray(emptySerialNumbers) || emptySerialNumbers.length === 0) &&
+    (!Array.isArray(filledSerialNumbers) || filledSerialNumbers.length === 0)
   ) {
     return res.status(400).json({ error: "Provide at least one cylinder ID." });
   }
 
   try {
-    // 🔹 Update Empty Cylinders
-    if (emptySerialNumbers.length > 0) {
+    // Update empty cylinders: mark status as 'empty' and reset company_id
+    if (emptySerialNumbers && emptySerialNumbers.length > 0) {
       await pool.query(
-        `UPDATE cylinders SET status = 'empty', company_id = NULL WHERE serial_number = ANY($1::text[])`,
+        "UPDATE cylinders SET status = 'empty', company_id = NULL WHERE serial_number = ANY($1::text[])",
         [emptySerialNumbers]
       );
-
-      await pool.query(
-        `INSERT INTO transactions (user_id, cylinder_id, action, company_id) 
-         SELECT $1, id, 'receive_empty', $2 
-         FROM cylinders WHERE serial_number = ANY($3::text[])`,
-        [req.user.id, companyId, emptySerialNumbers]
-      );
     }
 
-    // 🔹 Update Filled Cylinders (Change 'filled' to 'available')
-    if (filledSerialNumbers.length > 0) {
+    // Update filled cylinders: mark status as 'available' and reset company_id
+    if (filledSerialNumbers && filledSerialNumbers.length > 0) {
       await pool.query(
-        `UPDATE cylinders SET status = 'available', company_id = NULL WHERE serial_number = ANY($1::text[])`,
+        "UPDATE cylinders SET status = 'available', company_id = NULL WHERE serial_number = ANY($1::text[])",
         [filledSerialNumbers]
       );
-
-      await pool.query(
-        `INSERT INTO transactions (user_id, cylinder_id, action, company_id) 
-         SELECT $1, id, 'receive_filled', $2 
-         FROM cylinders WHERE serial_number = ANY($3::text[])`,
-        [req.user.id, companyId, filledSerialNumbers]
-      );
     }
 
-    res.json({ message: "Cylinders received successfully!" });
+    // Combine all serial numbers into one array
+    const allSerialNumbers = [
+      ...(emptySerialNumbers || []),
+      ...(filledSerialNumbers || []),
+    ];
+
+    // Generate a chalan number using the dispatch style ("CL-" prefix)
+    const timestampStr = Date.now().toString();
+    const randomPart = Math.floor(10 + Math.random() * 90); // random between 10 and 99
+    const chalanNumber = `CL-${timestampStr.slice(-4)}${randomPart}`;
+
+    // Insert transaction records for all received cylinders using a single query.
+    // The action is determined by the updated status in the cylinders table.
+    const insertResult = await pool.query(
+      `INSERT INTO transactions (user_id, cylinder_id, action, company_id, chalan_number)
+       SELECT $1, id,
+         CASE 
+           WHEN status = 'empty' THEN 'receive_empty'
+           WHEN status = 'available' THEN 'receive_filled'
+           ELSE 'receive'
+         END,
+         $2, $3
+       FROM cylinders
+       WHERE serial_number = ANY($4::text[])
+       RETURNING id`,
+      [req.user.id, companyId, chalanNumber, allSerialNumbers]
+    );
+
+    // Use the returned id to create a transaction ID (like in your dispatch endpoint)
+    const transactionId = `TXN-${insertResult.rows[0].id}`;
+
+    res.json({
+      message: "Cylinders received successfully!",
+      transactionId,
+      chalanNumber,
+    });
   } catch (error) {
     console.error("Receive Cylinder Error:", error);
     res.status(500).json({ error: "Database error", details: error.message });
