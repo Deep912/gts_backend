@@ -620,13 +620,20 @@ app.post("/complete-refill", authenticateJWT, async (req, res) => {
       });
     }
 
-    // Update status to 'available' (or 'refilled')
-    await pool.query(
-      "UPDATE cylinders SET status = 'available' WHERE serial_number = ANY($1::text[])",
-      [cylinderIds]
-    );
+    // Update cylinders: set status to 'available' and increment cylinder_run_count by 1.
+    const updateQuery = `
+      UPDATE cylinders 
+      SET status = 'available', 
+          cylinder_run_count = COALESCE(cylinder_run_count, 0) + 1
+      WHERE serial_number = ANY($1::text[])
+      RETURNING serial_number, cylinder_run_count
+    `;
+    const updateResult = await pool.query(updateQuery, [cylinderIds]);
 
-    res.json({ message: "Cylinders marked as filled successfully!" });
+    res.json({
+      message: "Cylinders marked as filled successfully!",
+      updatedCylinders: updateResult.rows,
+    });
   } catch (error) {
     console.error("Complete Refill Error:", error);
     res.status(500).json({ error: "Database error", details: error.message });
@@ -1696,6 +1703,53 @@ app.get("/admin/reports/gas-sub-type", authenticateJWT, async (req, res) => {
   }
 });
 
+app.get(
+  "/admin/reports/gas-type-summary",
+  authenticateJWT,
+  async (req, res) => {
+    try {
+      const query = `
+      SELECT 
+        gt.id,
+        gt.name,
+        COUNT(c.id) AS total_count,
+        COUNT(c.id) FILTER (WHERE c.status = 'dispatched') AS dispatched_count,
+        COUNT(c.id) FILTER (WHERE c.status = 'empty') AS empty_count
+      FROM cylinders c
+      JOIN gas_products gp ON c.gas_product_id = gp.id
+      JOIN gas_sub_types gst ON gp.gas_sub_type_id = gst.id
+      JOIN gas_types gt ON gst.gas_type_id = gt.id
+      GROUP BY gt.id, gt.name
+      ORDER BY gt.name;
+    `;
+      const result = await pool.query(query);
+      res.json(result.rows);
+    } catch (error) {
+      console.error("Error fetching gas type summary:", error);
+      res.status(500).json({ error: "Database error", details: error.message });
+    }
+  }
+);
+
+app.get("/admin/product-types", authenticateJWT, async (req, res) => {
+  try {
+    const query = `
+      SELECT DISTINCT 
+        CONCAT(gt.name, ' ', gst.name, ' ', gp.capacity::text, ' ', gp.measurement_unit) AS product_type
+      FROM gas_products gp
+      JOIN gas_sub_types gst ON gp.gas_sub_type_id = gst.id
+      JOIN gas_types gt ON gst.gas_type_id = gt.id
+      ORDER BY product_type;
+    `;
+    const result = await pool.query(query);
+    // Return an array of product type strings
+    res.json(result.rows.map((row) => row.product_type));
+  } catch (error) {
+    console.error("Error fetching product types:", error);
+    res.status(500).json({ error: "Database error", details: error.message });
+  }
+});
+
 app.get("/admin/reports/gas-type", authenticateJWT, async (req, res) => {
   const { gasType } = req.query;
   if (!gasType) {
@@ -2135,7 +2189,11 @@ app.post("/admin/add-product", authenticateJWT, async (req, res) => {
 // Daily Stock Report JSON Endpoint
 app.get("/admin/stock-report", authenticateJWT, async (req, res) => {
   try {
-    const query = `
+    const limit = parseInt(req.query.limit) || 10;
+    const offset = parseInt(req.query.offset) || 0;
+
+    // Data query with pagination.
+    const dataQuery = `
       SELECT 
         gp.id,
         CONCAT(gt.name, ' ', gst.name, ' ', gp.capacity, ' ', gp.measurement_unit) AS product_name,
@@ -2145,17 +2203,229 @@ app.get("/admin/stock-report", authenticateJWT, async (req, res) => {
       JOIN gas_sub_types gst ON gp.gas_sub_type_id = gst.id
       JOIN gas_types gt ON gst.gas_type_id = gt.id
       GROUP BY gp.id, product_name
-      ORDER BY product_name;
+      ORDER BY product_name
+      LIMIT $1 OFFSET $2;
     `;
-    const result = await pool.query(query);
-    const report = result.rows.map((row) => ({
+
+    // Count query for total number of groups.
+    const countQuery = `
+      SELECT COUNT(*) AS total
+      FROM (
+        SELECT gp.id
+        FROM cylinders c
+        JOIN gas_products gp ON c.gas_product_id = gp.id
+        JOIN gas_sub_types gst ON gp.gas_sub_type_id = gst.id
+        JOIN gas_types gt ON gst.gas_type_id = gt.id
+        GROUP BY gp.id, CONCAT(gt.name, ' ', gst.name, ' ', gp.capacity, ' ', gp.measurement_unit)
+      ) AS sub;
+    `;
+
+    const dataResult = await pool.query(dataQuery, [limit, offset]);
+    const countResult = await pool.query(countQuery);
+    const total = parseInt(countResult.rows[0].total, 10);
+
+    // Map the rows to include placeholders for yesterday's closing and today's opening.
+    const report = dataResult.rows.map((row) => ({
       product_name: row.product_name,
-      yesterday_closing: row.stock_count, // Placeholder for actual yesterday's closing stock
-      today_opening: row.stock_count, // Placeholder for actual today's opening stock
+      yesterday_closing: row.stock_count, // Placeholder
+      today_opening: row.stock_count, // Placeholder
     }));
-    res.json(report);
+
+    res.json({ total, rows: report });
   } catch (error) {
     console.error("Error fetching stock report:", error);
+    res.status(500).json({ error: "Database error", details: error.message });
+  }
+});
+
+// Create a new maintenance log
+app.post("/maintenance-logs", authenticateJWT, async (req, res) => {
+  const {
+    cylinder_id,
+    maintenance_date,
+    maintenance_type,
+    description,
+    performed_by,
+    next_inspection_date,
+  } = req.body;
+  if (!cylinder_id || !maintenance_date || !maintenance_type) {
+    return res.status(400).json({ error: "Missing required fields." });
+  }
+  try {
+    const result = await pool.query(
+      `INSERT INTO maintenance_logs (cylinder_id, maintenance_date, maintenance_type, description, performed_by, next_inspection_date, created_at, updated_at)
+       VALUES ($1, $2, $3, $4, $5, $6, NOW(), NOW())
+       RETURNING *`,
+      [
+        cylinder_id,
+        maintenance_date,
+        maintenance_type,
+        description || "",
+        performed_by || "",
+        next_inspection_date || null,
+      ]
+    );
+    res.json({
+      message: "Maintenance log created successfully.",
+      maintenanceLog: result.rows[0],
+    });
+  } catch (error) {
+    console.error("Error creating maintenance log:", error);
+    res.status(500).json({ error: "Database error", details: error.message });
+  }
+});
+
+// Maintenance Request Endpoint
+app.post("/maintenance-request", authenticateJWT, async (req, res) => {
+  const { cylinderIds, description } = req.body;
+
+  // Validate input
+  if (!Array.isArray(cylinderIds) || cylinderIds.length === 0) {
+    return res.status(400).json({ error: "No cylinder IDs provided." });
+  }
+  if (!description || description.trim() === "") {
+    return res.status(400).json({ error: "Maintenance description required." });
+  }
+
+  try {
+    // Fetch cylinders by serial numbers
+    const cylindersRes = await pool.query(
+      "SELECT serial_number, id, status FROM cylinders WHERE serial_number = ANY($1::text[])",
+      [cylinderIds]
+    );
+    if (cylindersRes.rows.length === 0) {
+      return res.status(400).json({ error: "No matching cylinders found." });
+    }
+
+    // Filter out those that are already under maintenance
+    const alreadyMaintenance = cylindersRes.rows.filter(
+      (row) => row.status === "maintenance"
+    );
+    const toUpdate = cylindersRes.rows.filter(
+      (row) => row.status !== "maintenance"
+    );
+
+    // If none remain to update, return an error
+    if (toUpdate.length === 0) {
+      return res.status(400).json({
+        error: "All provided cylinders are already under maintenance.",
+      });
+    }
+
+    // Update status for the cylinders that are not already in maintenance
+    const updateSerials = toUpdate.map((row) => row.serial_number);
+    await pool.query(
+      "UPDATE cylinders SET status = 'maintenance' WHERE serial_number = ANY($1::text[])",
+      [updateSerials]
+    );
+
+    // Get the numeric IDs for the cylinders to update
+    const cylinderNumericIds = toUpdate.map((row) => row.id);
+
+    // Insert maintenance log records for each updated cylinder.
+    // We record the current time as maintenance_start and requested_at.
+    const maintenanceQuery = `
+      INSERT INTO maintenance_logs 
+        (worker_id, cylinder_id, description, maintenance_start, status, requested_at, performed_by)
+      SELECT 
+        $1, unnest($2::int[]), $3, NOW(), 'requested', NOW(), $4
+      RETURNING id, cylinder_id
+    `;
+    const maintenanceValues = [
+      req.user.id,
+      cylinderNumericIds,
+      description,
+      req.user.username,
+    ];
+    const maintenanceRes = await pool.query(
+      maintenanceQuery,
+      maintenanceValues
+    );
+
+    res.json({
+      message: "Maintenance request submitted successfully!",
+      maintenanceLogs: maintenanceRes.rows,
+      skippedCylinders: alreadyMaintenance.map((row) => row.serial_number),
+    });
+  } catch (error) {
+    console.error("Maintenance Request Error:", error);
+    res.status(500).json({ error: "Database error", details: error.message });
+  }
+});
+
+app.get("/cylinder-status/:serial", authenticateJWT, async (req, res) => {
+  const { serial } = req.params;
+  try {
+    const result = await pool.query(
+      "SELECT status FROM cylinders WHERE serial_number = $1",
+      [serial]
+    );
+    if (result.rows.length === 0) {
+      return res.status(404).json({ error: "Cylinder not found" });
+    }
+    res.json({ status: result.rows[0].status });
+  } catch (error) {
+    console.error("Error checking cylinder status:", error);
+    res.status(500).json({ error: "Database error", details: error.message });
+  }
+});
+
+app.post("/maintenance-complete", authenticateJWT, async (req, res) => {
+  const { cylinderIds, description } = req.body;
+  if (!Array.isArray(cylinderIds) || cylinderIds.length === 0) {
+    return res.status(400).json({ error: "No cylinder IDs provided" });
+  }
+  try {
+    // Check if all cylinders are currently under maintenance.
+    const checkResult = await pool.query(
+      "SELECT serial_number FROM cylinders WHERE serial_number = ANY($1::text[]) AND status != 'maintenance'",
+      [cylinderIds]
+    );
+    if (checkResult.rows.length > 0) {
+      const notMaint = checkResult.rows
+        .map((row) => row.serial_number)
+        .join(", ");
+      return res
+        .status(400)
+        .json({ error: `Cylinders not under maintenance: ${notMaint}` });
+    }
+    // Update the cylinders to mark them as available.
+    await pool.query(
+      "UPDATE cylinders SET status = 'available' WHERE serial_number = ANY($1::text[])",
+      [cylinderIds]
+    );
+    // Update the maintenance logs for these cylinders that are still marked as 'maintenance'
+    const updateLogQuery = `
+      UPDATE maintenance_logs
+      SET maintenance_end = NOW(), status = 'completed', description = $2, performed_by = $3
+      WHERE cylinder_id IN (
+        SELECT id FROM cylinders WHERE serial_number = ANY($1::text[])
+      ) AND status = 'maintenance'
+      RETURNING cylinder_id
+    `;
+    const updateLogResult = await pool.query(updateLogQuery, [
+      cylinderIds,
+      description,
+      req.user.username,
+    ]);
+    res.json({
+      message: "Maintenance completed for selected cylinders.",
+      updatedMaintenance: updateLogResult.rows,
+    });
+  } catch (error) {
+    console.error("Maintenance Complete Error:", error);
+    res.status(500).json({ error: "Database error", details: error.message });
+  }
+});
+
+app.get("/maintenance-cylinders", authenticateJWT, async (req, res) => {
+  try {
+    const result = await pool.query(
+      "SELECT serial_number FROM cylinders WHERE status = 'maintenance'"
+    );
+    res.json(result.rows); // Array of objects: [{ serial_number: "CYL1010" }, ...]
+  } catch (error) {
+    console.error("Error fetching maintenance cylinders:", error);
     res.status(500).json({ error: "Database error", details: error.message });
   }
 });
