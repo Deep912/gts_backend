@@ -2297,12 +2297,16 @@ app.post("/maintenance-request", authenticateJWT, async (req, res) => {
       return res.status(400).json({ error: "No matching cylinders found." });
     }
 
-    // Filter out those that are already under maintenance
+    // Filter out those that are already under maintenance (either in-process or maintenance)
     const alreadyMaintenance = cylindersRes.rows.filter(
-      (row) => row.status === "maintenance"
+      (row) =>
+        row.status.toLowerCase() === "maintenance" ||
+        row.status.toLowerCase() === "in-process"
     );
     const toUpdate = cylindersRes.rows.filter(
-      (row) => row.status !== "maintenance"
+      (row) =>
+        row.status.toLowerCase() !== "maintenance" &&
+        row.status.toLowerCase() !== "in-process"
     );
 
     // If none remain to update, return an error
@@ -2328,7 +2332,7 @@ app.post("/maintenance-request", authenticateJWT, async (req, res) => {
       INSERT INTO maintenance_logs 
         (worker_id, cylinder_id, description, maintenance_start, status, requested_at, performed_by)
       SELECT 
-        $1, unnest($2::int[]), $3, NOW(), 'requested', NOW(), $4
+        $1, unnest($2::int[]), $3, NOW(), 'in-process', NOW(), $4
       RETURNING id, cylinder_id
     `;
     const maintenanceValues = [
@@ -2349,6 +2353,23 @@ app.post("/maintenance-request", authenticateJWT, async (req, res) => {
     });
   } catch (error) {
     console.error("Maintenance Request Error:", error);
+    res.status(500).json({ error: "Database error", details: error.message });
+  }
+});
+
+// Get all maintenance logs
+// Get all maintenance logs
+app.get("/maintenance-logs", authenticateJWT, async (req, res) => {
+  try {
+    const result = await pool.query(
+      `SELECT ml.*, c.serial_number 
+       FROM maintenance_logs ml 
+       JOIN cylinders c ON ml.cylinder_id = c.id
+       ORDER BY ml.requested_at DESC`
+    );
+    res.json(result.rows);
+  } catch (error) {
+    console.error("Error fetching maintenance logs:", error);
     res.status(500).json({ error: "Database error", details: error.message });
   }
 });
@@ -2394,13 +2415,13 @@ app.post("/maintenance-complete", authenticateJWT, async (req, res) => {
       "UPDATE cylinders SET status = 'available' WHERE serial_number = ANY($1::text[])",
       [cylinderIds]
     );
-    // Update the maintenance logs for these cylinders that are still marked as 'maintenance'
+    // Update the maintenance logs for these cylinders that are still marked as 'in-process'
     const updateLogQuery = `
       UPDATE maintenance_logs
-      SET maintenance_end = NOW(), status = 'completed', description = $2, performed_by = $3
+      SET maintenance_end = NOW(), status = 'maintenance done', description = $2, performed_by = $3
       WHERE cylinder_id IN (
         SELECT id FROM cylinders WHERE serial_number = ANY($1::text[])
-      ) AND status = 'maintenance'
+      ) AND status = 'in-process'
       RETURNING cylinder_id
     `;
     const updateLogResult = await pool.query(updateLogQuery, [
@@ -2426,6 +2447,35 @@ app.get("/maintenance-cylinders", authenticateJWT, async (req, res) => {
     res.json(result.rows); // Array of objects: [{ serial_number: "CYL1010" }, ...]
   } catch (error) {
     console.error("Error fetching maintenance cylinders:", error);
+    res.status(500).json({ error: "Database error", details: error.message });
+  }
+});
+
+app.get("/admin/reports/refill-summary", authenticateJWT, async (req, res) => {
+  try {
+    const todayQuery = `
+      SELECT COUNT(*) AS refilled_today
+      FROM transactions
+      WHERE action = 'refill'
+        AND timestamp >= date_trunc('day', CURRENT_TIMESTAMP)
+        AND timestamp < date_trunc('day', CURRENT_TIMESTAMP) + INTERVAL '1 day';
+    `;
+    const monthQuery = `
+      SELECT COUNT(*) AS refilled_this_month
+      FROM transactions
+      WHERE action = 'refill'
+        AND timestamp >= date_trunc('month', CURRENT_TIMESTAMP)
+        AND timestamp < date_trunc('month', CURRENT_TIMESTAMP) + INTERVAL '1 month';
+    `;
+    const todayResult = await pool.query(todayQuery);
+    const monthResult = await pool.query(monthQuery);
+
+    res.json({
+      refilled_today: todayResult.rows[0].refilled_today,
+      refilled_this_month: monthResult.rows[0].refilled_this_month,
+    });
+  } catch (error) {
+    console.error("Error fetching refill summary:", error);
     res.status(500).json({ error: "Database error", details: error.message });
   }
 });
