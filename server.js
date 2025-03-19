@@ -245,15 +245,20 @@ app.get("/worker/transactions", authenticateJWT, async (req, res) => {
 
 app.post("/dispatch-cylinder", authenticateJWT, async (req, res) => {
   const { serialNumbers, companyId, gas_product_id, quantity } = req.body;
-
-  console.log("Received Dispatch Data:", req.body);
+  console.log("Dispatch Request Payload:", req.body);
 
   if (!Array.isArray(serialNumbers) || serialNumbers.length === 0) {
+    console.error("No cylinder serial numbers provided.");
     return res
       .status(400)
       .json({ error: "Invalid request. Provide an array of serial numbers." });
   }
   if (!companyId || !gas_product_id || !quantity) {
+    console.error("Missing required fields:", {
+      companyId,
+      gas_product_id,
+      quantity,
+    });
     return res.status(400).json({ error: "Missing required fields." });
   }
 
@@ -263,39 +268,45 @@ app.post("/dispatch-cylinder", authenticateJWT, async (req, res) => {
       "SELECT id FROM companies WHERE id = $1",
       [companyId]
     );
+    console.log("Company check result:", checkCompany.rows);
     if (checkCompany.rows.length === 0) {
+      console.error("Invalid company ID:", companyId);
       return res.status(400).json({ error: "Invalid company ID" });
     }
 
-    // Check if serial numbers exist in the database
+    // Check if all serial numbers exist
     const checkCylinders = await pool.query(
       "SELECT serial_number FROM cylinders WHERE serial_number = ANY($1::text[])",
       [serialNumbers]
     );
+    console.log("Cylinders found:", checkCylinders.rows);
     if (checkCylinders.rows.length !== serialNumbers.length) {
+      const found = checkCylinders.rows.map((row) => row.serial_number);
+      const missing = serialNumbers.filter((sn) => !found.includes(sn));
+      console.error("Missing cylinders:", missing);
       return res.status(400).json({
         error: "Some cylinders are not found in the database",
-        found: checkCylinders.rows.map((row) => row.serial_number),
-        missing: serialNumbers.filter(
-          (sn) => !checkCylinders.rows.some((row) => row.serial_number === sn)
-        ),
+        found,
+        missing,
       });
     }
 
-    // Update cylinders: set status to 'dispatched' and assign the company ID.
+    // Update cylinders: mark as dispatched and assign the company ID.
     await pool.query(
       `UPDATE cylinders 
        SET status = 'dispatched', company_id = $1 
        WHERE serial_number = ANY($2::text[])`,
       [companyId, serialNumbers]
     );
+    console.log("Updated cylinders status to 'dispatched' for:", serialNumbers);
 
-    // Generate a chalan number using the last 4 digits of the timestamp and a random two-digit number.
+    // Generate a chalan number
     const timestampStr = Date.now().toString();
-    const randomPart = Math.floor(10 + Math.random() * 90); // Random number between 10 and 99
+    const randomPart = Math.floor(10 + Math.random() * 90);
     const chalanNumber = `CL-${timestampStr.slice(-4)}${randomPart}`;
+    console.log("Generated Chalan Number:", chalanNumber);
 
-    // Log the dispatch transaction and return the auto-generated id.
+    // Insert dispatch transaction and retrieve transaction id
     const insertResult = await pool.query(
       `INSERT INTO transactions (user_id, cylinder_id, action, company_id, chalan_number, performed_by)
        SELECT $1, id, 'dispatch', $2, $4, $5
@@ -304,20 +315,44 @@ app.post("/dispatch-cylinder", authenticateJWT, async (req, res) => {
        RETURNING id`,
       [req.user.id, companyId, serialNumbers, chalanNumber, req.user.username]
     );
-
-    // Use the returned id as the transaction identifier.
+    console.log("Transaction Insert Result:", insertResult.rows);
     const transactionId = `TXN-${insertResult.rows[0].id}`;
 
-    // Query the product price from the gas_products table.
-    const productRes = await pool.query(
-      "SELECT price FROM gas_products WHERE id = $1",
-      [gas_product_id]
+    // New Pricing Logic: First try company‑specific pricing
+    console.log(
+      "Fetching company-specific price for company:",
+      companyId,
+      "product:",
+      gas_product_id
     );
-    if (productRes.rows.length === 0) {
-      return res.status(400).json({ error: "Invalid gas product." });
+    const pricingRes = await pool.query(
+      "SELECT price FROM company_product_prices WHERE company_id = $1 AND product_id = $2",
+      [companyId, gas_product_id]
+    );
+    console.log("Company Product Pricing Query Result:", pricingRes.rows);
+
+    let price;
+    if (pricingRes.rows.length > 0) {
+      price = parseFloat(pricingRes.rows[0].price);
+      console.log("Using company-specific price:", price);
+    } else {
+      console.log(
+        "No company-specific pricing found; falling back to default product price."
+      );
+      const productRes = await pool.query(
+        "SELECT price FROM gas_products WHERE id = $1",
+        [gas_product_id]
+      );
+      console.log("Default product query result:", productRes.rows);
+      if (productRes.rows.length === 0) {
+        console.error("Invalid gas product ID:", gas_product_id);
+        return res.status(400).json({ error: "Invalid gas product." });
+      }
+      price = parseFloat(productRes.rows[0].price);
+      console.log("Using default product price:", price);
     }
-    const price = parseFloat(productRes.rows[0].price);
     const totalAmount = price * Number(quantity);
+    console.log("Calculated Total Amount:", totalAmount);
 
     res.json({
       message: "Cylinders dispatched successfully!",
