@@ -626,20 +626,34 @@ app.post("/complete-refill", authenticateJWT, async (req, res) => {
       SET status = 'available', 
           cylinder_run_count = COALESCE(cylinder_run_count, 0) + 1
       WHERE serial_number = ANY($1::text[])
-      RETURNING serial_number, cylinder_run_count
+      RETURNING id, serial_number, cylinder_run_count
     `;
     const updateResult = await pool.query(updateQuery, [cylinderIds]);
+
+    // Insert production log records for each updated cylinder.
+    // This records the refill (production) event by storing the cylinder id, worker id, and the time.
+    const productionInsertQuery = `
+      INSERT INTO production_logs (cylinder_id, worker_id, production_date, created_at)
+      SELECT id, $2, NOW(), NOW()
+      FROM cylinders
+      WHERE serial_number = ANY($1::text[])
+      RETURNING cylinder_id
+    `;
+    const productionResult = await pool.query(productionInsertQuery, [
+      cylinderIds,
+      req.user.id,
+    ]);
 
     res.json({
       message: "Cylinders marked as filled successfully!",
       updatedCylinders: updateResult.rows,
+      productionLogs: productionResult.rows,
     });
   } catch (error) {
     console.error("Complete Refill Error:", error);
     res.status(500).json({ error: "Database error", details: error.message });
   }
 });
-
 app.get("/empty-cylinders", authenticateJWT, async (req, res) => {
   try {
     const result = await pool.query(
@@ -2480,6 +2494,227 @@ app.get("/admin/reports/refill-summary", authenticateJWT, async (req, res) => {
   }
 });
 
+// Production Report Endpoint
+app.get("/admin/reports/production", authenticateJWT, async (req, res) => {
+  try {
+    const { start, end, gasType, gasSubType, productId } = req.query;
+
+    if (!start || !end) {
+      return res
+        .status(400)
+        .json({ error: "Start and end dates are required." });
+    }
+
+    // Start building the query conditions and parameter array
+    let conditions = `pl.production_date BETWEEN $1 AND $2`;
+    const params = [start, end];
+    let paramIndex = 3;
+
+    // Optional filters:
+    if (gasType) {
+      conditions += ` AND LOWER(gt.name) = LOWER($${paramIndex})`;
+      params.push(gasType);
+      paramIndex++;
+    }
+    if (gasSubType) {
+      conditions += ` AND LOWER(gst.name) = LOWER($${paramIndex})`;
+      params.push(gasSubType);
+      paramIndex++;
+    }
+    if (productId) {
+      conditions += ` AND gp.id = $${paramIndex}`;
+      params.push(productId);
+      paramIndex++;
+    }
+
+    const query = `
+      SELECT 
+        gt.name AS gas_type,
+        gst.name AS gas_sub_type,
+        gp.name AS product_name,
+        c.serial_number AS cylinder_id,
+        pl.production_date,
+        pl.worker_id
+      FROM production_logs pl
+      JOIN cylinders c ON pl.cylinder_id = c.id
+      JOIN gas_products gp ON c.gas_product_id = gp.id
+      JOIN gas_sub_types gst ON gp.gas_sub_type_id = gst.id
+      JOIN gas_types gt ON gst.gas_type_id = gt.id
+      WHERE ${conditions}
+      ORDER BY pl.production_date DESC;
+    `;
+
+    const result = await pool.query(query, params);
+    res.json(result.rows);
+  } catch (error) {
+    console.error("Error fetching production report:", error);
+    res.status(500).json({ error: "Database error", details: error.message });
+  }
+});
+
+app.post("/outside-sale", authenticateJWT, async (req, res) => {
+  const { companyId, productId, quantity, performedBy } = req.body;
+
+  if (!companyId || !productId || !quantity) {
+    return res.status(400).json({
+      error: "Missing required fields: companyId, productId, quantity",
+    });
+  }
+
+  try {
+    // Fetch client name from complines table
+    const clientResult = await pool.query(
+      "SELECT client_name FROM complines WHERE company_id = $1",
+      [companyId]
+    );
+    const clientName =
+      clientResult.rows.length > 0 ? clientResult.rows[0].client_name : "";
+
+    // Fetch the company-specific product price from company_product_prices table
+    const priceResult = await pool.query(
+      "SELECT price FROM company_product_prices WHERE company_id = $1 AND product_id = $2",
+      [companyId, productId]
+    );
+    if (priceResult.rows.length === 0) {
+      return res.status(400).json({
+        error: "No price defined for this product for the selected company.",
+      });
+    }
+    const price = parseFloat(priceResult.rows[0].price);
+    const total = price * parseFloat(quantity);
+
+    // Insert sale data into outside_sales table
+    const saleResult = await pool.query(
+      `INSERT INTO outside_sales (company_id, product_id, quantity, price, total, performed_by, client_name, created_at)
+       VALUES ($1, $2, $3, $4, $5, $6, $7, NOW())
+       RETURNING *`,
+      [
+        companyId,
+        productId,
+        quantity,
+        price,
+        total,
+        performedBy || req.user.username,
+        clientName,
+      ]
+    );
+
+    res.json({
+      message: "Outside sale processed successfully!",
+      sale: saleResult.rows[0],
+    });
+  } catch (error) {
+    console.error("Outside Sale Error:", error);
+    res.status(500).json({ error: "Database error", details: error.message });
+  }
+});
+
+// company vise price endpoints
+
+// POST endpoint to add a company-specific product price
+// GET: Fetch company product pricing records,
+// with an optional query parameter companyId to filter by company.
+app.get("/admin/company-product-prices", authenticateJWT, async (req, res) => {
+  try {
+    const query = `
+      SELECT 
+        cpp.id,
+        cpp.company_id,
+        cpp.product_id,
+        cpp.price,
+        comp.name AS company_name,
+        CONCAT(gt.name, ' ', gst.name, ' ', gp.capacity, ' ', gp.measurement_unit) AS product_label
+      FROM company_product_prices cpp
+      JOIN companies comp ON cpp.company_id = comp.id
+      JOIN gas_products gp ON cpp.product_id = gp.id
+      JOIN gas_sub_types gst ON gp.gas_sub_type_id = gst.id
+      JOIN gas_types gt ON gst.gas_type_id = gt.id
+      ORDER BY comp.name, product_label;
+    `;
+    const result = await pool.query(query);
+    res.json(result.rows);
+  } catch (error) {
+    console.error("Error fetching company product prices:", error);
+    res.status(500).json({ error: "Database error", details: error.message });
+  }
+});
+
+// POST: Create a new company product pricing record.
+app.post("/admin/company-product-prices", authenticateJWT, async (req, res) => {
+  const { companyId, productId, price } = req.body;
+  if (!companyId || !productId || price === undefined) {
+    return res.status(400).json({
+      error: "Missing required fields: companyId, productId, and price",
+    });
+  }
+  try {
+    const result = await pool.query(
+      `INSERT INTO company_product_prices (company_id, product_id, price, created_at)
+       VALUES ($1, $2, $3, NOW())
+       RETURNING *`,
+      [companyId, productId, price]
+    );
+    res.json(result.rows[0]);
+  } catch (error) {
+    console.error("Error saving company product pricing:", error);
+    res.status(500).json({ error: "Database error", details: error.message });
+  }
+});
+
+// PUT: Update an existing pricing record by its ID.
+app.put(
+  "/admin/company-product-prices/:id",
+  authenticateJWT,
+  async (req, res) => {
+    const { id } = req.params;
+    const { companyId, productId, price } = req.body;
+    if (!companyId || !productId || price === undefined) {
+      return res.status(400).json({
+        error: "Missing required fields: companyId, productId, and price",
+      });
+    }
+    try {
+      const result = await pool.query(
+        `UPDATE company_product_prices
+       SET company_id = $1, product_id = $2, price = $3, updated_at = NOW()
+       WHERE id = $4 RETURNING *`,
+        [companyId, productId, price, id]
+      );
+      if (result.rowCount === 0) {
+        return res.status(404).json({ error: "Pricing record not found" });
+      }
+      res.json(result.rows[0]);
+    } catch (error) {
+      console.error("Error updating company product pricing:", error);
+      res.status(500).json({ error: "Database error", details: error.message });
+    }
+  }
+);
+
+// DELETE: Delete a pricing record by its ID.
+app.delete(
+  "/admin/company-product-prices/:id",
+  authenticateJWT,
+  async (req, res) => {
+    const { id } = req.params;
+    try {
+      const result = await pool.query(
+        "DELETE FROM company_product_prices WHERE id = $1 RETURNING *",
+        [id]
+      );
+      if (result.rowCount === 0) {
+        return res.status(404).json({ error: "Pricing record not found" });
+      }
+      res.json({
+        message: "Pricing record deleted successfully",
+        record: result.rows[0],
+      });
+    } catch (error) {
+      console.error("Error deleting company product pricing:", error);
+      res.status(500).json({ error: "Database error", details: error.message });
+    }
+  }
+);
 // testing code
 
 app.get("/product-name/:id", authenticateJWT, async (req, res) => {
