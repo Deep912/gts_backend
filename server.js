@@ -193,44 +193,44 @@ app.get("/worker-transactions", authenticateJWT, async (req, res) => {
   }
 });
 
-app.get("/worker/transactions", authenticateJWT, async (req, res) => {
+app.get("/worker/transactions/grouped", authenticateJWT, async (req, res) => {
   try {
     const userId = req.user.id;
     const search = req.query.search || "";
-    const limit = parseInt(req.query.limit) || 10;
-    const offset = parseInt(req.query.offset) || 0;
+    const limit = parseInt(req.query.limit, 10) || 10;
+    const offset = parseInt(req.query.offset, 10) || 0;
 
-    // Build the base query including allowed actions and using performed_by column
+    // Base query to select transactions for the current user that have a chalan number
     let baseQuery = `
       FROM transactions t
-      LEFT JOIN companies c ON t.company_id = c.id
       WHERE t.user_id = $1
-        AND LOWER(t.action) IN ('dispatch', 'receive_empty', 'receive_filled')
+        AND t.chalan_number IS NOT NULL
     `;
     const queryParams = [userId];
 
+    // If a search term is provided, filter by chalan_number (case-insensitive)
     if (search) {
-      baseQuery += " AND ('TXN-' || t.id) ILIKE $2";
+      baseQuery += " AND t.chalan_number ILIKE $2";
       queryParams.push(`%${search}%`);
     }
 
-    // Count total matching records for pagination
-    const countQuery = `SELECT COUNT(*) ${baseQuery}`;
+    // Count the total distinct groups (by chalan_number)
+    const countQuery = `SELECT COUNT(DISTINCT t.chalan_number) AS total ${baseQuery}`;
     const countResult = await pool.query(countQuery, queryParams);
-    const total = parseInt(countResult.rows[0].count);
+    const total = parseInt(countResult.rows[0].total, 10);
 
-    // Fetch the actual rows using limit and offset, ordered by t.id DESC
+    // Group transactions by chalan_number, action, and performed_by.
+    // For each group, get the maximum timestamp (latest date) and count the number of rows (cylinders)
     let dataQuery = `
       SELECT 
-        ('TXN-' || t.id) AS transaction_number,
         t.chalan_number,
         t.action,
-        t.cylinder_id,
-        c.name AS company_name,
         t.performed_by,
-        t.timestamp
+        MAX(t.timestamp) AS timestamp,
+        COUNT(*) AS cylinder_count
       ${baseQuery}
-      ORDER BY t.id DESC
+      GROUP BY t.chalan_number, t.action, t.performed_by
+      ORDER BY MAX(t.timestamp) DESC
       LIMIT $${queryParams.length + 1} OFFSET $${queryParams.length + 2}
     `;
     queryParams.push(limit, offset);
@@ -239,6 +239,7 @@ app.get("/worker/transactions", authenticateJWT, async (req, res) => {
 
     res.json({ total, rows: result.rows });
   } catch (error) {
+    console.error("Grouped Transactions Error:", error);
     res.status(500).json({ error: "Database error", details: error.message });
   }
 });
@@ -2631,6 +2632,9 @@ app.post("/outside-sale", authenticateJWT, async (req, res) => {
   }
 
   try {
+    // Debug log: check the authenticated user
+    console.log("Authenticated user:", req.user.username);
+
     // Fetch client name from companies table
     const clientResult = await pool.query(
       "SELECT name AS client_name FROM companies WHERE id = $1",
@@ -2671,7 +2675,7 @@ app.post("/outside-sale", authenticateJWT, async (req, res) => {
         quantity,
         price,
         total,
-        performedBy || req.user.username,
+        req.user.username,
         clientName,
       ]
     );
@@ -2843,6 +2847,51 @@ app.get("/admin/company-product-price", authenticateJWT, async (req, res) => {
     res.status(500).json({ error: "Database error", details: error.message });
   }
 });
+
+app.get("/outside-sales/grouped", authenticateJWT, async (req, res) => {
+  try {
+    const limit = parseInt(req.query.limit, 10) || 10;
+    const offset = parseInt(req.query.offset, 10) || 0;
+    const search = req.query.search || "";
+
+    // Base query: select from outside_sales table.
+    let baseQuery = `FROM outside_sales os WHERE 1=1`;
+    const params = [];
+
+    // Optional search: filter by outside_sale_id (case-insensitive)
+    if (search) {
+      baseQuery += ` AND os.outside_sale_id ILIKE $${params.length + 1}`;
+      params.push(`%${search}%`);
+    }
+
+    // Count distinct groups by outside_sale_id for pagination
+    const countQuery = `SELECT COUNT(DISTINCT os.outside_sale_id) AS total ${baseQuery}`;
+    const countResult = await pool.query(countQuery, params);
+    const total = parseInt(countResult.rows[0].total, 10);
+
+    // Group the outside sales by outside_sale_id and performed_by.
+    // For each group, get the maximum created_at (latest timestamp) and sum the quantity (cylinder count).
+    const dataQuery = `
+      SELECT 
+        os.outside_sale_id,
+        MAX(os.created_at) AS timestamp,
+        os.performed_by,
+        SUM(os.quantity) AS cylinder_count
+      ${baseQuery}
+      GROUP BY os.outside_sale_id, os.performed_by
+      ORDER BY MAX(os.created_at) DESC
+      LIMIT $${params.length + 1} OFFSET $${params.length + 2}
+    `;
+    params.push(limit, offset);
+
+    const dataResult = await pool.query(dataQuery, params);
+    res.json({ total, rows: dataResult.rows });
+  } catch (error) {
+    console.error("Grouped Outside Sales Error:", error);
+    res.status(500).json({ error: "Database error", details: error.message });
+  }
+});
+
 // testing code
 
 //aging managment
