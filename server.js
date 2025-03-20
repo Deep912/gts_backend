@@ -2631,9 +2631,9 @@ app.post("/outside-sale", authenticateJWT, async (req, res) => {
   }
 
   try {
-    // Fetch client name from complines table
+    // Fetch client name from companies table
     const clientResult = await pool.query(
-      "SELECT client_name FROM complines WHERE company_id = $1",
+      "SELECT name AS client_name FROM companies WHERE id = $1",
       [companyId]
     );
     const clientName =
@@ -2652,12 +2652,20 @@ app.post("/outside-sale", authenticateJWT, async (req, res) => {
     const price = parseFloat(priceResult.rows[0].price);
     const total = price * parseFloat(quantity);
 
-    // Insert sale data into outside_sales table
+    // Generate a unique Outside Sale ID (e.g., OS-XXXXXX)
+    const timestampStr = Date.now().toString();
+    const randomPart = Math.floor(10 + Math.random() * 90); // random two-digit number
+    const outsideSaleId = `OS-${timestampStr.slice(-4)}${randomPart}`;
+
+    // Insert sale data into outside_sales table with the new outside_sale_id
     const saleResult = await pool.query(
-      `INSERT INTO outside_sales (company_id, product_id, quantity, price, total, performed_by, client_name, created_at)
-       VALUES ($1, $2, $3, $4, $5, $6, $7, NOW())
+      `INSERT INTO outside_sales (
+         outside_sale_id, company_id, product_id, quantity, price, total, performed_by, client_name, created_at
+       )
+       VALUES ($1, $2, $3, $4, $5, $6, $7, $8, NOW())
        RETURNING *`,
       [
+        outsideSaleId,
         companyId,
         productId,
         quantity,
