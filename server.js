@@ -263,23 +263,21 @@ app.post("/dispatch-cylinder", authenticateJWT, async (req, res) => {
   }
 
   try {
-    // Check if the company exists
+    // 1) Check if the company exists
     const checkCompany = await pool.query(
       "SELECT id FROM companies WHERE id = $1",
       [companyId]
     );
-    console.log("Company check result:", checkCompany.rows);
     if (checkCompany.rows.length === 0) {
       console.error("Invalid company ID:", companyId);
       return res.status(400).json({ error: "Invalid company ID" });
     }
 
-    // Check if all serial numbers exist
+    // 2) Verify the cylinders exist
     const checkCylinders = await pool.query(
       "SELECT serial_number FROM cylinders WHERE serial_number = ANY($1::text[])",
       [serialNumbers]
     );
-    console.log("Cylinders found:", checkCylinders.rows);
     if (checkCylinders.rows.length !== serialNumbers.length) {
       const found = checkCylinders.rows.map((row) => row.serial_number);
       const missing = serialNumbers.filter((sn) => !found.includes(sn));
@@ -291,69 +289,64 @@ app.post("/dispatch-cylinder", authenticateJWT, async (req, res) => {
       });
     }
 
-    // Update cylinders: mark as dispatched and assign the company ID.
+    // 3) Update cylinders: mark as dispatched, set the company ID, and set updated_at = NOW()
     await pool.query(
-      `UPDATE cylinders 
-       SET status = 'dispatched', company_id = $1 
+      `UPDATE cylinders
+         SET status = 'dispatched',
+             company_id = $1,
+             updated_at = NOW()               -- <<--- ensures aging is tracked
        WHERE serial_number = ANY($2::text[])`,
       [companyId, serialNumbers]
     );
     console.log("Updated cylinders status to 'dispatched' for:", serialNumbers);
 
-    // Generate a chalan number
+    // 4) Generate a chalan number
     const timestampStr = Date.now().toString();
     const randomPart = Math.floor(10 + Math.random() * 90);
     const chalanNumber = `CL-${timestampStr.slice(-4)}${randomPart}`;
     console.log("Generated Chalan Number:", chalanNumber);
 
-    // Insert dispatch transaction and retrieve transaction id
+    // 5) Log the dispatch transaction & get a transaction ID
     const insertResult = await pool.query(
       `INSERT INTO transactions (user_id, cylinder_id, action, company_id, chalan_number, performed_by)
        SELECT $1, id, 'dispatch', $2, $4, $5
-       FROM cylinders
-       WHERE serial_number = ANY($3::text[])
+         FROM cylinders
+        WHERE serial_number = ANY($3::text[])
        RETURNING id`,
       [req.user.id, companyId, serialNumbers, chalanNumber, req.user.username]
     );
-    console.log("Transaction Insert Result:", insertResult.rows);
     const transactionId = `TXN-${insertResult.rows[0].id}`;
 
-    // New Pricing Logic: First try company‑specific pricing
-    console.log(
-      "Fetching company-specific price for company:",
-      companyId,
-      "product:",
-      gas_product_id
-    );
+    // 6) Determine the final price:
+    //    a) Try company-specific price from company_product_prices
+    //    b) Otherwise, fallback to the product's default price
+    const compId = parseInt(companyId, 10);
+    const prodId = parseInt(gas_product_id, 10);
+
     const pricingRes = await pool.query(
-      "SELECT price FROM company_product_prices WHERE company_id = $1 AND product_id = $2",
-      [companyId, gas_product_id]
+      "SELECT price FROM company_product_prices WHERE company_id = $1 AND product_id = $2 LIMIT 1",
+      [compId, prodId]
     );
-    console.log("Company Product Pricing Query Result:", pricingRes.rows);
 
     let price;
     if (pricingRes.rows.length > 0) {
       price = parseFloat(pricingRes.rows[0].price);
-      console.log("Using company-specific price:", price);
     } else {
-      console.log(
-        "No company-specific pricing found; falling back to default product price."
-      );
       const productRes = await pool.query(
         "SELECT price FROM gas_products WHERE id = $1",
-        [gas_product_id]
+        [prodId]
       );
-      console.log("Default product query result:", productRes.rows);
       if (productRes.rows.length === 0) {
         console.error("Invalid gas product ID:", gas_product_id);
         return res.status(400).json({ error: "Invalid gas product." });
       }
       price = parseFloat(productRes.rows[0].price);
-      console.log("Using default product price:", price);
     }
+
     const totalAmount = price * Number(quantity);
     console.log("Calculated Total Amount:", totalAmount);
 
+    // 7) Send final response
     res.json({
       message: "Cylinders dispatched successfully!",
       transactionId,
@@ -689,6 +682,7 @@ app.post("/complete-refill", authenticateJWT, async (req, res) => {
     res.status(500).json({ error: "Database error", details: error.message });
   }
 });
+
 app.get("/empty-cylinders", authenticateJWT, async (req, res) => {
   try {
     const result = await pool.query(
@@ -2750,7 +2744,100 @@ app.delete(
     }
   }
 );
+
+// New endpoint to fetch company-specific product price
+app.get("/admin/company-product-price", authenticateJWT, async (req, res) => {
+  const { companyId, productId } = req.query;
+
+  if (!companyId || !productId) {
+    return res
+      .status(400)
+      .json({ error: "companyId and productId are required" });
+  }
+
+  try {
+    // First, try to fetch company-specific pricing
+    const pricingRes = await pool.query(
+      "SELECT price FROM company_product_prices WHERE company_id = $1 AND product_id = $2",
+      [companyId, productId]
+    );
+
+    if (pricingRes.rows.length > 0) {
+      return res.json({ price: pricingRes.rows[0].price });
+    }
+
+    // Fallback: fetch default price from gas_products
+    const productRes = await pool.query(
+      "SELECT price FROM gas_products WHERE id = $1",
+      [productId]
+    );
+
+    if (productRes.rows.length === 0) {
+      return res.status(400).json({ error: "Invalid productId" });
+    }
+
+    return res.json({ price: productRes.rows[0].price });
+  } catch (error) {
+    console.error("Error fetching company product price:", error);
+    res.status(500).json({ error: "Database error", details: error.message });
+  }
+});
 // testing code
+
+//aging managment
+
+app.get("/admin/reports/aging", authenticateJWT, async (req, res) => {
+  try {
+    // Optional filters
+    let { company, start, end } = req.query;
+    let conditions = [];
+    let params = [];
+
+    // If a company filter is provided, match by company name (case-insensitive)
+    if (company) {
+      conditions.push(`comp.name ILIKE $${params.length + 1}`);
+      params.push(`%${company}%`);
+    }
+
+    // If a date range is provided, filter based on the cylinder's updated_at field
+    // (assuming that updated_at reflects when the cylinder was last dispatched/received)
+    if (start && end) {
+      conditions.push(
+        `c.updated_at BETWEEN $${params.length + 1} AND $${params.length + 2}`
+      );
+      params.push(start, end);
+    }
+
+    const whereClause =
+      conditions.length > 0 ? "WHERE " + conditions.join(" AND ") : "";
+
+    const query = `
+      SELECT 
+        comp.name AS company_name,
+        gt.name AS product_type,
+        gst.name AS cylinder_family_code,
+        COUNT(c.id) AS total_cylinders,
+        COUNT(*) FILTER (WHERE DATE_PART('day', NOW() - c.updated_at) BETWEEN 0 AND 29) AS range_0_29,
+        COUNT(*) FILTER (WHERE DATE_PART('day', NOW() - c.updated_at) BETWEEN 30 AND 59) AS range_30_59,
+        COUNT(*) FILTER (WHERE DATE_PART('day', NOW() - c.updated_at) BETWEEN 60 AND 89) AS range_60_89,
+        COUNT(*) FILTER (WHERE DATE_PART('day', NOW() - c.updated_at) >= 90) AS range_above_90
+      FROM cylinders c
+      JOIN companies comp ON c.company_id = comp.id
+      JOIN gas_products gp ON c.gas_product_id = gp.id
+      JOIN gas_sub_types gst ON gp.gas_sub_type_id = gst.id
+      JOIN gas_types gt ON gst.gas_type_id = gt.id
+      ${whereClause}
+      GROUP BY comp.name, gt.name, gst.name
+      ORDER BY comp.name, gt.name, gst.name;
+    `;
+
+    const result = await pool.query(query, params);
+    res.json(result.rows);
+  } catch (error) {
+    console.error("Error fetching aging report:", error);
+    res.status(500).json({ error: "Database error", details: error.message });
+  }
+});
 
 app.get("/product-name/:id", authenticateJWT, async (req, res) => {
   const { id } = req.params; // now 'id' is the cylinder serial number (e.g., "CYL1010")
