@@ -290,21 +290,22 @@ app.post("/dispatch-cylinder", authenticateJWT, async (req, res) => {
       });
     }
 
-    // 3) Update cylinders: mark as dispatched, set the company ID, and set updated_at = NOW()
+    // 3) Update cylinders: mark as dispatched, set the company ID, and update the timestamp
     await pool.query(
       `UPDATE cylinders
          SET status = 'dispatched',
              company_id = $1,
-             updated_at = NOW()               -- <<--- ensures aging is tracked
+             updated_at = NOW()
        WHERE serial_number = ANY($2::text[])`,
       [companyId, serialNumbers]
     );
     console.log("Updated cylinders status to 'dispatched' for:", serialNumbers);
 
-    // 4) Generate a chalan number
-    const timestampStr = Date.now().toString();
-    const randomPart = Math.floor(10 + Math.random() * 90);
-    const chalanNumber = `CL-${timestampStr.slice(-4)}${randomPart}`;
+    // 4) Generate a chalan number using the sequence
+    const chalanRes = await pool.query(
+      "SELECT 'CL-' || nextval('chalan_seq') AS chalan_number"
+    );
+    const chalanNumber = chalanRes.rows[0].chalan_number;
     console.log("Generated Chalan Number:", chalanNumber);
 
     // 5) Log the dispatch transaction & get a transaction ID
@@ -318,17 +319,13 @@ app.post("/dispatch-cylinder", authenticateJWT, async (req, res) => {
     );
     const transactionId = `TXN-${insertResult.rows[0].id}`;
 
-    // 6) Determine the final price:
-    //    a) Try company-specific price from company_product_prices
-    //    b) Otherwise, fallback to the product's default price
+    // 6) Determine the final price
     const compId = parseInt(companyId, 10);
     const prodId = parseInt(gas_product_id, 10);
-
     const pricingRes = await pool.query(
       "SELECT price FROM company_product_prices WHERE company_id = $1 AND product_id = $2 LIMIT 1",
       [compId, prodId]
     );
-
     let price;
     if (pricingRes.rows.length > 0) {
       price = parseFloat(pricingRes.rows[0].price);
@@ -343,7 +340,6 @@ app.post("/dispatch-cylinder", authenticateJWT, async (req, res) => {
       }
       price = parseFloat(productRes.rows[0].price);
     }
-
     const totalAmount = price * Number(quantity);
     console.log("Calculated Total Amount:", totalAmount);
 
@@ -463,7 +459,6 @@ app.get("/dispatched-cylinders", authenticateJWT, async (req, res) => {
 });
 
 // 🔹 Receive Cylinders API
-
 app.post("/receive-cylinder", authenticateJWT, async (req, res) => {
   const { emptySerialNumbers, filledSerialNumbers, companyId } = req.body;
 
@@ -498,10 +493,13 @@ app.post("/receive-cylinder", authenticateJWT, async (req, res) => {
       ...(filledSerialNumbers || []),
     ];
 
-    // Generate a chalan number using the dispatch style ("CL-" prefix)
-    const timestampStr = Date.now().toString();
-    const randomPart = Math.floor(10 + Math.random() * 90); // random between 10 and 99
-    const receiveChalanNumber = `CL-${timestampStr.slice(-4)}${randomPart}`;
+    // Generate a chalan number using the sequence.
+    // Ensure that the sequence 'chalan_seq' exists and proper privileges have been granted.
+    const chalanRes = await pool.query(
+      "SELECT 'CL-' || nextval('chalan_seq') AS chalan_number"
+    );
+    const receiveChalanNumber = chalanRes.rows[0].chalan_number;
+    console.log("Generated Chalan Number:", receiveChalanNumber);
 
     // Insert transaction records for all received cylinders using a single query.
     // The action is determined by the updated status in the cylinders table.
@@ -530,7 +528,6 @@ app.post("/receive-cylinder", authenticateJWT, async (req, res) => {
     const transactionId = `TXN-${insertResult.rows[0].id}`;
 
     // Fetch detailed cylinder info including a computed product label.
-    // The product label is computed by joining gas_products, gas_sub_types, and gas_types.
     const cylinderDetailsResult = await pool.query(
       `SELECT 
          c.serial_number, 
@@ -547,7 +544,7 @@ app.post("/receive-cylinder", authenticateJWT, async (req, res) => {
     const receivedCylinders = cylinderDetailsResult.rows.map((row) => ({
       serial_number: row.serial_number,
       gas_product_id: row.gas_product_id,
-      productLabel: row.productlabel, // computed value from our query
+      productLabel: row.productlabel,
     }));
 
     res.json({
@@ -2632,7 +2629,6 @@ app.post("/outside-sale", authenticateJWT, async (req, res) => {
   }
 
   try {
-    // Debug log: check the authenticated user
     console.log("Authenticated user:", req.user.username);
 
     // Fetch client name from companies table
@@ -2656,20 +2652,17 @@ app.post("/outside-sale", authenticateJWT, async (req, res) => {
     const price = parseFloat(priceResult.rows[0].price);
     const total = price * parseFloat(quantity);
 
-    // Generate a unique Outside Sale ID (e.g., OS-XXXXXX)
-    const timestampStr = Date.now().toString();
-    const randomPart = Math.floor(10 + Math.random() * 90); // random two-digit number
-    const outsideSaleId = `OS-${timestampStr.slice(-4)}${randomPart}`;
-
-    // Insert sale data into outside_sales table with the new outside_sale_id
+    // Insert sale data into outside_sales table using sequence for outside_sale_id
     const saleResult = await pool.query(
       `INSERT INTO outside_sales (
          outside_sale_id, company_id, product_id, quantity, price, total, performed_by, client_name, created_at
        )
-       VALUES ($1, $2, $3, $4, $5, $6, $7, $8, NOW())
+       VALUES (
+         'OS-' || nextval('outside_sale_seq'),
+         $1, $2, $3, $4, $5, $6, $7, NOW()
+       )
        RETURNING *`,
       [
-        outsideSaleId,
         companyId,
         productId,
         quantity,
