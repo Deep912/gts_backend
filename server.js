@@ -2281,6 +2281,46 @@ app.get("/admin/stock-report", authenticateJWT, async (req, res) => {
   }
 });
 
+app.get(
+  "/admin/reports/customer-transaction",
+  authenticateJWT,
+  async (req, res) => {
+    const { company, start, end } = req.query;
+    if (!company) {
+      return res.status(400).json({ error: "Company is required" });
+    }
+    if (!start || !end) {
+      return res
+        .status(400)
+        .json({ error: "Start and end dates are required" });
+    }
+    try {
+      const query = `
+        SELECT 
+          t.chalan_number,
+          t.action,
+          COUNT(c.id) AS cylinder_count,
+          array_agg(c.serial_number) AS cylinder_ids,
+          MIN(t.timestamp) AS timestamp,
+          MAX(t.performed_by) AS performed_by
+        FROM transactions t
+        JOIN cylinders c ON t.cylinder_id = c.id
+        JOIN companies comp ON t.company_id = comp.id
+        WHERE LOWER(comp.name) LIKE LOWER($1)
+          AND t.timestamp BETWEEN $2 AND $3
+        GROUP BY t.chalan_number, t.action
+        ORDER BY timestamp DESC;
+      `;
+      const params = [`%${company}%`, start, end];
+      const result = await pool.query(query, params);
+      res.json(result.rows);
+    } catch (error) {
+      console.error("Error fetching customer transaction report:", error);
+      res.status(500).json({ error: "Database error", details: error.message });
+    }
+  }
+);
+
 // Create a new maintenance log
 app.post("/maintenance-logs", authenticateJWT, async (req, res) => {
   const {
@@ -2645,7 +2685,7 @@ app.post("/outside-sale", authenticateJWT, async (req, res) => {
 // with an optional query parameter companyId to filter by company.
 app.get("/admin/company-product-prices", authenticateJWT, async (req, res) => {
   try {
-    const query = `
+    let query = `
       SELECT 
         cpp.id,
         cpp.company_id,
@@ -2658,9 +2698,22 @@ app.get("/admin/company-product-prices", authenticateJWT, async (req, res) => {
       JOIN gas_products gp ON cpp.product_id = gp.id
       JOIN gas_sub_types gst ON gp.gas_sub_type_id = gst.id
       JOIN gas_types gt ON gst.gas_type_id = gt.id
-      ORDER BY comp.name, product_label;
     `;
-    const result = await pool.query(query);
+    const conditions = [];
+    const params = [];
+    if (req.query.companyId) {
+      conditions.push(`cpp.company_id = $${params.length + 1}`);
+      params.push(req.query.companyId);
+    }
+    if (req.query.productId) {
+      conditions.push(`cpp.product_id = $${params.length + 1}`);
+      params.push(req.query.productId);
+    }
+    if (conditions.length > 0) {
+      query += " WHERE " + conditions.join(" AND ");
+    }
+    query += " ORDER BY comp.name, product_label";
+    const result = await pool.query(query, params);
     res.json(result.rows);
   } catch (error) {
     console.error("Error fetching company product prices:", error);
