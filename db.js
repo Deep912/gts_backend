@@ -9,9 +9,14 @@ const pool = new Pool({
   port: process.env.DB_PORT || 5432,
   idleTimeoutMillis: 30000, // Disconnect idle connections after 30s
   connectionTimeoutMillis: 2000, // Timeout for new connections
+  ssl: {
+    rejectUnauthorized: false, // Allows SSL without verifying the RDS certificate
+  },
 });
 
-pool.on("connect", () => console.log("Connected to PostgreSQL database."));
+pool.on("connect", () =>
+  console.log("Connected to PostgreSQL database with SSL enabled.")
+);
 pool.on("error", (err) => console.error("Database connection error:", err));
 
 module.exports = pool;

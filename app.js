@@ -1,6 +1,8 @@
 require("dotenv").config();
 const express = require("express");
 const cors = require("cors");
+const fs = require("fs");
+const https = require("https");
 const bcrypt = require("bcrypt");
 const jwt = require("jsonwebtoken");
 const pool = require("./db");
@@ -8,11 +10,11 @@ const { authenticateJWT } = require("./middleware/authMiddleware");
 const { logEvent } = require("./auditLogger");
 const app = express();
 
-// ✅ Middleware: Ensure Express Can Parse JSON & URL-encoded Data
+// Middleware: Parse JSON & URL-encoded data
 app.use(express.json());
 app.use(express.urlencoded({ extended: true }));
 
-// ✅ CORS Policy: Allow Vercel, ngrok, and localhost
+// CORS Policy: Allow Vercel, ngrok, and localhost
 const allowedOrigins = [
   "https://fr-gts-demo-1bvh.vercel.app", // Vercel Frontend
   "http://localhost:5173", // Local Frontend for Testing
@@ -42,13 +44,13 @@ app.use(
   })
 );
 
-// ✅ Handle Preflight OPTIONS Requests
+// Handle Preflight OPTIONS Requests
 app.options("*", cors());
 
 app.set("trust proxy", true);
 
 // ✅ Root Test Route
-app.get("/", (req, res) => {
+app.get("/testing", (req, res) => {
   res.json({ message: "Server is running and fully connected!" });
 });
 
@@ -2965,8 +2967,18 @@ app.get("/product-name/:id", authenticateJWT, async (req, res) => {
   }
 });
 
-// Start the server
-const PORT = process.env.PORT || 5000;
-app.listen(PORT, "0.0.0.0", () =>
-  console.log(`🚀 Server running on port ${PORT}`)
-);
+const options = {
+  key: fs.readFileSync(
+    "/etc/letsencrypt/live/gtsbackend.ap-south-1.elasticbeanstalk.com/privkey.pem"
+  ),
+  cert: fs.readFileSync(
+    "/etc/letsencrypt/live/gtsbackend.ap-south-1.elasticbeanstalk.com/fullchain.pem"
+  ),
+};
+
+const PORT = process.env.PORT || 443;
+
+// Create an HTTPS server using the certificate options
+https.createServer(options, app).listen(PORT, "0.0.0.0", () => {
+  console.log(`🚀 HTTPS server running on port ${PORT}`);
+});
