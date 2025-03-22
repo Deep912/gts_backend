@@ -2966,19 +2966,16 @@ app.get("/product-name/:id", authenticateJWT, async (req, res) => {
     res.status(500).json({ error: "Database error", details: error.message });
   }
 });
-
+const PORT = process.env.PORT || 443;
 const options = {
   key: fs.readFileSync(
-    "/etc/letsencrypt/live/gtsbackend.ap-south-1.elasticbeanstalk.com/privkey.pem"
+    "/etc/letsencrypt/live/api.archoncreations.com/privkey.pem"
   ),
   cert: fs.readFileSync(
-    "/etc/letsencrypt/live/gtsbackend.ap-south-1.elasticbeanstalk.com/fullchain.pem"
+    "/etc/letsencrypt/live/api.archoncreations.com/fullchain.pem"
   ),
 };
 
-const PORT = process.env.PORT || 443;
-
-// Create an HTTPS server using the certificate options
 https.createServer(options, app).listen(PORT, "0.0.0.0", () => {
   console.log(`🚀 HTTPS server running on port ${PORT}`);
 });
