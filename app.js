@@ -16,6 +16,7 @@ app.use(express.urlencoded({ extended: true }));
 
 // CORS Policy: Allow Vercel, ngrok, and localhost
 const allowedOrigins = [
+  "https://software.archoncreations.com", // Production Frontend
   "https://fr-gts-demo-1bvh.vercel.app", // Vercel Frontend
   "http://localhost:5173", // Local Frontend for Testing
   "http://127.0.0.1:5173", // Alternative Local Frontend
